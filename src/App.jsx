@@ -32,7 +32,7 @@ const LISTINGS_KEY = "campusExchangeAdminListings";
 const PROFILE_KEY = "campusExchangeStudentProfile";
 const BLOCKS = ["A", "H", "N", "U", "P"];
 const CATEGORIES = ["Books", "Electronics", "Accessories", "Other"];
-const API_BASE_URL = (import.meta.env.VITE_API_URL || "http://localhost:5001/api").replace(/\/$/, "");
+const API_BASE_URL = `${import.meta.env.VITE_API_URL.replace(/\/$/, "")}/api`;
 
 async function listingRequest(path, options = {}) {
 const token =
@@ -2426,7 +2426,7 @@ function AdminLogin() {
 
     try {
       const response = await fetch(
-        "http://localhost:5001/api/auth/login",
+        `${API_BASE_URL}/auth/login`,
         {
           method: "POST",
           headers: {
