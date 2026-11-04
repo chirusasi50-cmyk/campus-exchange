@@ -9,6 +9,7 @@ import authRoutes from "./routes/authRoutes.js";
 import listingRoutes from "./routes/listingRoutes.js";
 
 const app = express();
+app.set("trust proxy", 1);
 
 // CORS configuration
 app.use(cors({
