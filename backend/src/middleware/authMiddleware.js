@@ -7,21 +7,15 @@ const authMiddleware = async (req, res, next) => {
 
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return res.status(401).json({
-        message: "Access denied. Please login first.",
-      });
-    }
-
-    if (!process.env.JWT_SECRET) {
-      return res.status(500).json({
-        message: "Server authentication configuration error",
+        message: "Access denied. Please log in first.",
       });
     }
 
     const token = authHeader.split(" ")[1];
 
-    if (!token) {
-      return res.status(401).json({
-        message: "Access denied. Token is missing.",
+    if (!process.env.JWT_SECRET) {
+      return res.status(500).json({
+        message: "Server authentication configuration error",
       });
     }
 
@@ -51,9 +45,10 @@ const authMiddleware = async (req, res, next) => {
     console.error("Authentication middleware error:", error);
 
     return res.status(500).json({
-      message: "Authentication failed due to a server error",
+      message: "Authentication failed",
     });
   }
 };
 
+export const protect = authMiddleware;
 export default authMiddleware;

@@ -19,7 +19,7 @@ const router = express.Router();
 router.get("/", getListings);
 router.get("/mine", authMiddleware, getMyListings);
 
-// Admin-only routes (must come before /:id)
+// Admin-only routes
 router.put(
   "/admin/:id",
   authMiddleware,
@@ -39,7 +39,7 @@ router.post("/", authMiddleware, createListing);
 router.put("/:id", authMiddleware, editListing);
 router.delete("/:id", authMiddleware, removeListing);
 
-// Get individual listing
+// Individual listing
 router.get("/:id", getListingById);
 
 export default router;

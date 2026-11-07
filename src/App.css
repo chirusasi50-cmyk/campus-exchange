@@ -3579,3 +3579,22 @@ a {
   font-size: 12px;
   margin-top: 8px;
 }
+.forgot-password-link {
+  display: block;
+  width: fit-content;
+  margin: 0 0 12px auto;
+  padding: 4px 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: #1b5a43;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+
+.forgot-password-link:hover {
+  color: #0d3829;
+  text-decoration: underline;
+}

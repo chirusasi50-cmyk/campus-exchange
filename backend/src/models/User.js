@@ -7,6 +7,8 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
+      minlength: 2,
+      maxlength: 60,
     },
 
     email: {
@@ -21,6 +23,7 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: true,
       minlength: 8,
+      maxlength: 72,
       select: false,
     },
 
@@ -28,6 +31,33 @@ const userSchema = new mongoose.Schema(
       type: String,
       enum: ["student", "admin"],
       default: "student",
+    },
+
+    // Email verification
+    isEmailVerified: {
+      type: Boolean,
+      default: true,
+    },
+
+    emailOtpHash: {
+      type: String,
+      select: false,
+    },
+
+    emailOtpExpiresAt: {
+      type: Date,
+      select: false,
+    },
+
+    // Forgot password
+    resetOtpHash: {
+      type: String,
+      select: false,
+    },
+
+    resetOtpExpiresAt: {
+      type: Date,
+      select: false,
     },
   },
   {
@@ -43,7 +73,7 @@ userSchema.pre("save", async function () {
   this.password = await bcrypt.hash(this.password, salt);
 });
 
-// Compare entered password with hashed password
+// Compare entered password with stored password
 userSchema.methods.comparePassword = async function (enteredPassword) {
   return bcrypt.compare(enteredPassword, this.password);
 };

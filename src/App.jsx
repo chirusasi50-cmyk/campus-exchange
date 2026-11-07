@@ -32,12 +32,13 @@ const LISTINGS_KEY = "campusExchangeAdminListings";
 const PROFILE_KEY = "campusExchangeStudentProfile";
 const BLOCKS = ["A", "H", "N", "U", "P"];
 const CATEGORIES = ["Books", "Electronics", "Accessories", "Other"];
-const API_BASE_URL = `${import.meta.env.VITE_API_URL.replace(/\/$/, "")}/api`;
+const API_BASE_URL = `${(import.meta.env.VITE_API_URL || "http://localhost:5001").replace(/\/$/, "")}/api`;
 
 async function listingRequest(path, options = {}) {
-const token =
-  sessionStorage.getItem("adminToken") ||
-  sessionStorage.getItem("campusExchangeToken");
+  const isAdmin = sessionStorage.getItem(ADMIN_AUTH_KEY) === "true";
+  const token = isAdmin
+    ? sessionStorage.getItem("adminToken")
+    : sessionStorage.getItem("campusExchangeToken");
   const response = await fetch(`${API_BASE_URL}/listings${path}`, {
     ...options,
     headers: {
@@ -269,6 +270,18 @@ function ProtectedAdminRoute({ children }) {
   );
 }
 
+// The marketplace can be opened by either a logged-in student or an admin.
+function ProtectedMarketplaceRoute({ children }) {
+  const isStudent = sessionStorage.getItem(STUDENT_AUTH_KEY) === "true";
+  const isAdmin = sessionStorage.getItem(ADMIN_AUTH_KEY) === "true";
+
+  return isStudent || isAdmin ? (
+    children
+  ) : (
+    <Navigate to="/login" replace />
+  );
+}
+
 // ============================================================
 // HEADER
 // ============================================================
@@ -352,115 +365,223 @@ function StudentLogin() {
   const navigate = useNavigate();
 
   const [mode, setMode] = useState("login");
+  const [stage, setStage] = useState("auth");
+
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const passwordStrength = checkPasswordStrength(password);
   const [confirmPassword, setConfirmPassword] = useState("");
+  const [otp, setOtp] = useState("");
 
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
 
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(false);
 
   const isRegister = mode === "register";
 
-  function switchMode(selectedMode) {
-    setMode(selectedMode);
+  function switchMode(nextMode) {
+    setMode(nextMode);
+    setStage("auth");
     setError("");
+    setNotice("");
     setPassword("");
     setConfirmPassword("");
+    setOtp("");
   }
 
+  // API request helper
+  async function authRequest(endpoint, payload) {
+    const response = await fetch(
+      `${API_BASE_URL}/auth/${endpoint}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      }
+    );
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        data.message || `Request failed (${response.status}).`
+      );
+    }
+
+    return data;
+  }
+
+  // Store authentication information after successful login
+  function completeLogin(data) {
+    if (!data.token || !data.user) {
+      throw new Error(
+        "Authentication response is missing the token or user details."
+      );
+    }
+
+    // Keep student and admin sessions separate in this browser tab.
+    sessionStorage.removeItem(ADMIN_AUTH_KEY);
+    sessionStorage.removeItem("adminToken");
+    sessionStorage.setItem("campusExchangeToken", data.token);
+
+    sessionStorage.setItem(STUDENT_AUTH_KEY, "true");
+
+    sessionStorage.setItem(
+      "campusExchangeStudentEmail",
+      data.user.email
+    );
+
+    sessionStorage.setItem(
+      "campusExchangeStudentId",
+      data.user.id || data.user._id || ""
+    );
+
+    localStorage.setItem(
+      PROFILE_KEY,
+      JSON.stringify({
+        ...readProfile(),
+        name: data.user.name,
+        email: data.user.email,
+      })
+    );
+
+    navigate("/welcome", { replace: true });
+  }
+
+  // Form submission
   async function submit(event) {
     event.preventDefault();
+
     setError("");
-
-    if (isRegister) {
-      if (!name.trim()) {
-        setError("Please enter your full name.");
-        return;
-      }
-
-      if (password.length < 8) {
-        setError("Password must contain at least 8 characters.");
-        return;
-      }
-
-      if (password !== confirmPassword) {
-        setError("Passwords do not match.");
-        return;
-      }
-    }
+    setNotice("");
 
     try {
       setLoading(true);
 
-      const endpoint = isRegister ? "register" : "login";
+      // STEP 1: VERIFY EMAIL OTP
+      if (stage === "verify") {
+        if (!/^\d{6}$/.test(otp.trim())) {
+          throw new Error("Enter the 6-digit verification OTP.");
+        }
 
-      const payload = isRegister
-        ? {
+        const data = await authRequest(
+          "verify-email-otp",
+          {
+            email: email.trim(),
+            otp: otp.trim(),
+          }
+        );
+
+        completeLogin(data);
+        return;
+      }
+
+      // STEP 2: FORGOT PASSWORD
+      if (stage === "forgot") {
+        await authRequest(
+          "forgot-password",
+          {
+            email: email.trim(),
+          }
+        );
+
+        setStage("reset");
+
+        setNotice(
+          "If an account exists for this email, a password reset OTP has been sent."
+        );
+
+        return;
+      }
+
+      // STEP 3: RESET PASSWORD
+      if (stage === "reset") {
+        if (!/^\d{6}$/.test(otp.trim())) {
+          throw new Error("Enter the 6-digit password reset OTP.");
+        }
+
+        if (password.length < 8) {
+          throw new Error(
+            "New password must contain at least 8 characters."
+          );
+        }
+
+        if (password !== confirmPassword) {
+          throw new Error("Passwords do not match.");
+        }
+
+        await authRequest(
+          "reset-password",
+          {
+            email: email.trim(),
+            otp: otp.trim(),
+            newPassword: password,
+          }
+        );
+
+        setStage("auth");
+        setMode("login");
+        setOtp("");
+        setPassword("");
+        setConfirmPassword("");
+
+        setNotice(
+          "Password reset successfully. Please log in with your new password."
+        );
+
+        return;
+      }
+
+      // STEP 4: REGISTER
+      if (isRegister) {
+        if (!name.trim()) {
+          throw new Error("Please enter your full name.");
+        }
+
+        if (password.length < 8) {
+          throw new Error(
+            "Password must contain at least 8 characters."
+          );
+        }
+
+        if (password !== confirmPassword) {
+          throw new Error("Passwords do not match.");
+        }
+
+        await authRequest(
+          "register",
+          {
             name: name.trim(),
             email: email.trim(),
             password,
           }
-        : {
-            email: email.trim(),
-            password,
-          };
+        );
 
-      const response = await fetch(
-        `${API_BASE_URL}/auth/${endpoint}`,
+        setStage("verify");
+        setOtp("");
+
+        setNotice(
+          "A 6-digit verification code has been sent to your email."
+        );
+
+        return;
+      }
+
+      // STEP 5: LOGIN
+      const data = await authRequest(
+        "login",
         {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(payload),
+          email: email.trim(),
+          password,
         }
       );
 
-      const data = await response.json().catch(() => ({}));
-
-      if (!response.ok) {
-        throw new Error(
-          data.message ||
-            (isRegister
-              ? "Registration failed."
-              : "Invalid email or password.")
-        );
-      }
-
-      if (!data.token || !data.user) {
-        throw new Error("Invalid authentication server response.");
-      }
-
-      // Store authentication token
-      sessionStorage.setItem(
-        "campusExchangeToken",
-        data.token
-      );
-
-      sessionStorage.setItem(STUDENT_AUTH_KEY, "true");
-
-      sessionStorage.setItem(
-        "campusExchangeStudentEmail",
-        data.user.email
-      );
-      sessionStorage.setItem("campusExchangeStudentId", data.user.id);
-
-      // Store student profile
-      localStorage.setItem(
-        PROFILE_KEY,
-        JSON.stringify({
-          ...readProfile(),
-          name: data.user.name,
-          email: data.user.email,
-        })
-      );
-
-      navigate("/welcome", { replace: true });
+      completeLogin(data);
 
     } catch (err) {
       setError(
@@ -470,6 +591,29 @@ function StudentLogin() {
       setLoading(false);
     }
   }
+
+  // Dynamic heading
+  const heading =
+    stage === "verify"
+      ? "Verify Your Email"
+      : stage === "forgot"
+      ? "Forgot Password"
+      : stage === "reset"
+      ? "Reset Your Password"
+      : isRegister
+      ? "Create Account"
+      : "Welcome 😊";
+
+  const description =
+    stage === "verify"
+      ? `Enter the 6-digit code sent to ${email}.`
+      : stage === "forgot"
+      ? "Enter your registered email address to receive a reset code."
+      : stage === "reset"
+      ? "Enter the reset OTP and choose a new password."
+      : isRegister
+      ? "Create your account and join your campus community."
+      : "Sign in to discover great deals and connect with students on your campus.";
 
   return (
     <main className="auth-page">
@@ -481,69 +625,73 @@ function StudentLogin() {
 
         {/* BRAND */}
         <Link to="/login" className="auth-brand">
+
           <span className="brand-icon">C</span>
 
           <span>
             <strong>Campus Exchange</strong>
             <small>Vignan University Marketplace</small>
           </span>
+
         </Link>
 
         {/* LOGIN / REGISTER TOGGLE */}
-        <div className="auth-mode-toggle">
+        {stage === "auth" && (
+          <div className="auth-mode-toggle">
 
-          <button
-            type="button"
-            className={
-              !isRegister
-                ? "auth-mode-button active"
-                : "auth-mode-button"
-            }
-            onClick={() => switchMode("login")}
-          >
-            Login
-          </button>
+            <button
+              type="button"
+              className={
+                !isRegister
+                  ? "auth-mode-button active"
+                  : "auth-mode-button"
+              }
+              onClick={() => switchMode("login")}
+            >
+              Login
+            </button>
 
-          <button
-            type="button"
-            className={
-              isRegister
-                ? "auth-mode-button active"
-                : "auth-mode-button"
-            }
-            onClick={() => switchMode("register")}
-          >
-            Register
-          </button>
+            <button
+              type="button"
+              className={
+                isRegister
+                  ? "auth-mode-button active"
+                  : "auth-mode-button"
+              }
+              onClick={() => switchMode("register")}
+            >
+              Register
+            </button>
 
-        </div>
+          </div>
+        )}
 
         {/* HEADING */}
         <div className="auth-heading">
 
-          <div className="auth-emoji">🎓</div>
+          <div className="auth-emoji">
+            {stage === "verify"
+              ? "✉️"
+              : stage === "forgot" || stage === "reset"
+              ? "🔐"
+              : "🎓"}
+          </div>
 
           <p className="eyebrow">
             YOUR CAMPUS, YOUR COMMUNITY
           </p>
 
-          <h1>
-            {isRegister ? "Create Account" : "Welcome 😊"}
-          </h1>
+          <h1>{heading}</h1>
 
-          <p>
-            {isRegister
-              ? "Create your account and join your campus community."
-              : "Sign in to discover great deals and connect with students on your campus."}
-          </p>
+          <p>{description}</p>
 
         </div>
 
         {/* FORM */}
         <form className="auth-form" onSubmit={submit}>
 
-          {/* FULL NAME - REGISTER ONLY */}
-          {isRegister && (
+          {/* FULL NAME */}
+          {stage === "auth" && isRegister && (
             <>
               <label htmlFor="student-name">
                 Full Name
@@ -576,99 +724,69 @@ function StudentLogin() {
             placeholder="you@example.com"
             autoComplete="email"
             required
+            readOnly={stage === "verify" || stage === "reset"}
           />
+
+          {/* OTP */}
+          {(stage === "verify" || stage === "reset") && (
+            <>
+              <label htmlFor="student-otp">
+                {stage === "verify"
+                  ? "Email Verification OTP"
+                  : "Password Reset OTP"}
+              </label>
+
+              <input
+                id="student-otp"
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                value={otp}
+                onChange={(e) =>
+                  setOtp(
+                    e.target.value.replace(/\D/g, "").slice(0, 6)
+                  )
+                }
+                placeholder="Enter 6-digit OTP"
+                maxLength={6}
+                required
+              />
+            </>
+          )}
 
           {/* PASSWORD */}
-          <label htmlFor="student-password">
-            Password
-          </label>
-
-          <div className="password-wrapper">
-
-            <input
-              id="student-password"
-              type={showPassword ? "text" : "password"}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder={
-                isRegister
-                  ? "Create a password"
-                  : "Enter your password"
-              }
-              autoComplete={
-                isRegister ? "new-password" : "current-password"
-              }
-              minLength={isRegister ? 8 : undefined}
-              required
-            />
-          {isRegister && password && (() => {
-  const passwordStrength = checkPasswordStrength(password);
-
-  return (
-    <div className="password-strength">
-      <div className="strength-header">
-        <span>Password Strength</span>
-        <strong>{passwordStrength.level}</strong>
-      </div>
-
-      <div className="strength-bars">
-        {[1, 2, 3, 4].map((bar) => (
-          <div
-            key={bar}
-            className={`strength-bar ${
-              bar <= passwordStrength.score
-                ? `strength-${passwordStrength.score}`
-                : ""
-            }`}
-          />
-        ))}
-      </div>
-
-      {passwordStrength.score < 3 ? (
-        <p className="password-hint">
-          ⚠️ Use uppercase, lowercase, numbers and special characters.
-        </p>
-      ) : (
-        <p className="password-success">
-          ✓ Good password! Keep it secure.
-        </p>
-      )}
-    </div>
-  );
-})()}  
-            <button
-              type="button"
-              className="password-toggle"
-              onClick={() =>
-                setShowPassword((value) => !value)
-              }
-            >
-              {showPassword ? "Hide" : "Show"}
-            </button>
-
-          </div>
-
-          {/* CONFIRM PASSWORD - REGISTER ONLY */}
-          {isRegister && (
+          {(stage === "auth" || stage === "reset") && (
             <>
-              <label htmlFor="student-confirm-password">
-                Confirm Password
+              <label htmlFor="student-password">
+                {stage === "reset"
+                  ? "New Password"
+                  : "Password"}
               </label>
 
               <div className="password-wrapper">
 
                 <input
-                  id="student-confirm-password"
-                  type={
-                    showConfirmPassword ? "text" : "password"
+                  id="student-password"
+                  type={showPassword ? "text" : "password"}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder={
+                    stage === "reset"
+                      ? "Enter new password"
+                      : isRegister
+                      ? "Create a password"
+                      : "Enter your password"
                   }
-                  value={confirmPassword}
-                  onChange={(e) =>
-                    setConfirmPassword(e.target.value)
+                  autoComplete={
+                    stage === "reset" || isRegister
+                      ? "new-password"
+                      : "current-password"
                   }
-                  placeholder="Re-enter your password"
-                  autoComplete="new-password"
-                  minLength={8}
+                  minLength={
+                    stage === "auth" && !isRegister
+                      ? undefined
+                      : 8
+                  }
                   required
                 />
 
@@ -676,16 +794,78 @@ function StudentLogin() {
                   type="button"
                   className="password-toggle"
                   onClick={() =>
-                    setShowConfirmPassword(
-                      (value) => !value
-                    )
+                    setShowPassword((value) => !value)
                   }
                 >
-                  {showConfirmPassword ? "Hide" : "Show"}
+                  {showPassword ? "Hide" : "Show"}
                 </button>
 
               </div>
+
+              {/* CONFIRM PASSWORD */}
+              {(isRegister || stage === "reset") && (
+                <>
+                  <label htmlFor="student-confirm-password">
+                    Confirm Password
+                  </label>
+
+                  <div className="password-wrapper">
+
+                    <input
+                      id="student-confirm-password"
+                      type={
+                        showConfirmPassword
+                          ? "text"
+                          : "password"
+                      }
+                      value={confirmPassword}
+                      onChange={(e) =>
+                        setConfirmPassword(e.target.value)
+                      }
+                      placeholder="Re-enter your password"
+                      autoComplete="new-password"
+                      minLength={8}
+                      required
+                    />
+
+                    <button
+                      type="button"
+                      className="password-toggle"
+                      onClick={() =>
+                        setShowConfirmPassword(
+                          (value) => !value
+                        )
+                      }
+                    >
+                      {showConfirmPassword ? "Hide" : "Show"}
+                    </button>
+
+                  </div>
+                </>
+              )}
             </>
+          )}
+
+          {/* FORGOT PASSWORD LINK */}
+{stage === "auth" && !isRegister && (
+  <button
+    type="button"
+    className="forgot-password-link"
+    onClick={() => {
+      setStage("forgot");
+      setError("");
+      setNotice("");
+    }}
+  >
+    Forgot password?
+  </button>
+)}
+
+          {/* NOTICE */}
+          {notice && (
+            <p className="password-success" role="status">
+              {notice}
+            </p>
           )}
 
           {/* ERROR */}
@@ -695,39 +875,67 @@ function StudentLogin() {
             </p>
           )}
 
-          {/* SUBMIT BUTTON */}
+          {/* SUBMIT */}
           <button
             type="submit"
             className="button button-primary full-width"
             disabled={loading}
           >
             {loading
-              ? isRegister
-                ? "Creating account..."
-                : "Signing in..."
+              ? "Please wait..."
+              : stage === "verify"
+              ? "Verify Email →"
+              : stage === "forgot"
+              ? "Send Reset OTP →"
+              : stage === "reset"
+              ? "Reset Password →"
               : isRegister
-                ? "Create Account →"
-                : "Login ←"}
+              ? "Create Account →"
+              : "Login ←"}
           </button>
 
         </form>
 
+        {/* BACK BUTTON */}
+        {stage !== "auth" && (
+          <p className="auth-footer">
+
+            <button
+              type="button"
+              onClick={() => {
+                setStage("auth");
+                setMode("login");
+                setError("");
+                setNotice("");
+                setOtp("");
+              }}
+            >
+              ← Back to login
+            </button>
+
+          </p>
+        )}
+
         {/* FOOTER */}
-        <div className="auth-divider">
-          <span>MADE FOR STUDENTS</span>
-        </div>
+        {stage === "auth" && (
+          <>
+            <div className="auth-divider">
+              <span>MADE FOR STUDENTS</span>
+            </div>
 
-        <div className="auth-features">
-          <span>✓ Campus community</span>
-          <span>✓ Student-friendly deals</span>
-        </div>
+            <div className="auth-features">
+              <span>✓ Campus community</span>
+              <span>✓ Student-friendly deals</span>
+            </div>
 
-        <p className="auth-footer">
-          Administration access?{" "}
-          <Link to="/admin/login">
-            Admin login
-          </Link>
-        </p>
+            <p className="auth-footer">
+              Administration access?{" "}
+              <Link to="/admin/login">
+                Admin login
+              </Link>
+            </p>
+          </>
+        )}
 
       </section>
     </main>
@@ -2087,10 +2295,12 @@ function EditItemModal({ product, onClose, onSave }) {
 // SHARED LISTING ACTIONS
 // ============================================================
 
-function useListingActions(setProducts, useApi = false) {
+function useListingActions(setProducts, useApi = false, isAdmin = false) {
   async function updateProduct(updated) {
     if (useApi) {
-      const data = await listingRequest(`/${updated.id}`, {
+      const data = await listingRequest(
+        isAdmin ? `/admin/${updated.id}` : `/${updated.id}`,
+        {
         method: "PUT",
         body: listingPayload(updated),
       });
@@ -2115,7 +2325,10 @@ function useListingActions(setProducts, useApi = false) {
       const item = window.confirm("Delete this listing? This cannot be undone.");
       if (!item) return false;
       try {
-        await listingRequest(`/${id}`, { method: "DELETE" });
+        await listingRequest(
+          isAdmin ? `/admin/${id}` : `/${id}`,
+          { method: "DELETE" }
+        );
         setProducts((products) => products.filter((product) => product.id !== id));
         return true;
       } catch (error) {
@@ -2155,6 +2368,7 @@ function useListingActions(setProducts, useApi = false) {
 // ============================================================
 
 function Marketplace() {
+  const isAdmin = sessionStorage.getItem(ADMIN_AUTH_KEY) === "true";
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -2168,7 +2382,7 @@ function Marketplace() {
   const [selectedBlock, setSelectedBlock] = useState("");
   const [editing, setEditing] = useState(null);
 
-  const actions = useListingActions(setProducts, true);
+  const actions = useListingActions(setProducts, true, isAdmin);
 
   useEffect(() => {
     let active = true;
@@ -2269,15 +2483,17 @@ function Marketplace() {
             </p>
           </div>
 
-          <button
-            className="button button-primary"
-            onClick={() => {
-              setSelectedBlock("");
-              setShowSell(true);
-            }}
-          >
-            ＋ Sell an Item
-          </button>
+          {!isAdmin && (
+            <button
+              className="button button-primary"
+              onClick={() => {
+                setSelectedBlock("");
+                setShowSell(true);
+              }}
+            >
+              ＋ Sell an Item
+            </button>
+          )}
         </div>
 
         {listingsError && <p className="form-error" role="alert">{listingsError}</p>}
@@ -2338,8 +2554,8 @@ function Marketplace() {
               <ProductCard
                 key={product.id}
                 product={product}
-                onEdit={product.owner?._id === sessionStorage.getItem("campusExchangeStudentId") ? setEditing : undefined}
-                onDelete={product.owner?._id === sessionStorage.getItem("campusExchangeStudentId") ? actions.deleteProduct : undefined}
+                onEdit={isAdmin || product.owner?._id === sessionStorage.getItem("campusExchangeStudentId") ? setEditing : undefined}
+                onDelete={isAdmin || product.owner?._id === sessionStorage.getItem("campusExchangeStudentId") ? actions.deleteProduct : undefined}
               />
             ))}
           </section>
@@ -2413,60 +2629,153 @@ function Marketplace() {
 function AdminLogin() {
   const navigate = useNavigate();
 
+  const [stage, setStage] = useState("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [otp, setOtp] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(false);
 
+  function changeStage(nextStage) {
+    setStage(nextStage);
+    setError("");
+    setNotice("");
+  }
+
+  // API request helper
+  async function authRequest(endpoint, payload) {
+    const response = await fetch(
+      `${API_BASE_URL}/auth/${endpoint}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      }
+    );
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        data.message || `Request failed (${response.status}).`
+      );
+    }
+
+    return data;
+  }
+
+  // Form submission
   async function submit(event) {
     event.preventDefault();
 
     setError("");
+    setNotice("");
     setLoading(true);
 
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/auth/login`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
+      // STEP 1: FORGOT PASSWORD
+      if (stage === "forgot") {
+        await authRequest(
+          "admin/forgot-password",
+          {
             email: email.trim(),
-            password: password,
-          }),
+          }
+        );
+
+        setStage("reset");
+
+        setNotice(
+          "If an admin account exists for this email, a password reset OTP has been sent."
+        );
+
+        return;
+      }
+
+      // STEP 2: RESET PASSWORD
+      if (stage === "reset") {
+        if (!/^\d{6}$/.test(otp.trim())) {
+          throw new Error(
+            "Enter the 6-digit password reset OTP."
+          );
+        }
+
+        if (newPassword.length < 8) {
+          throw new Error(
+            "New password must contain at least 8 characters."
+          );
+        }
+
+        if (newPassword !== confirmPassword) {
+          throw new Error("Passwords do not match.");
+        }
+
+        await authRequest(
+          "admin/reset-password",
+          {
+            email: email.trim(),
+            otp: otp.trim(),
+            newPassword,
+          }
+        );
+
+        setStage("login");
+        setOtp("");
+        setPassword("");
+        setNewPassword("");
+        setConfirmPassword("");
+
+        setNotice(
+          "Admin password reset successfully. Please log in with your new password."
+        );
+
+        return;
+      }
+
+      // STEP 3: ADMIN LOGIN
+      const data = await authRequest(
+        "login",
+        {
+          email: email.trim(),
+          password,
         }
       );
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        setError(
-          data.message || "Invalid admin email or password."
-        );
-        return;
-      }
-
-      // Check whether the logged-in user is an admin
+      // Check admin role
       if (data.user?.role !== "admin") {
-        setError("Access denied. Admin account required.");
-        return;
+        throw new Error(
+          "Access denied. Admin account required."
+        );
       }
 
-      // Store authentication details
+      // Keep admin and student sessions separate.
+      sessionStorage.removeItem(STUDENT_AUTH_KEY);
+      sessionStorage.removeItem("campusExchangeStudentEmail");
+      sessionStorage.removeItem("campusExchangeStudentId");
       sessionStorage.setItem(ADMIN_AUTH_KEY, "true");
       sessionStorage.setItem("adminToken", data.token);
-      sessionStorage.setItem("campusExchangeToken", data.token);
-      // Navigate to admin dashboard
+      sessionStorage.setItem(
+        "campusExchangeToken",
+        data.token
+      );
+
+      // Navigate to dashboard
       navigate("/admin/dashboard", {
         replace: true,
       });
 
-    } catch (error) {
-      console.error("Admin login error:", error);
+    } catch (requestError) {
+      console.error(
+        "Admin authentication error:",
+        requestError
+      );
 
       setError(
+        requestError.message ||
         "Unable to connect to the server. Please try again."
       );
 
@@ -2475,11 +2784,27 @@ function AdminLogin() {
     }
   }
 
+  // Dynamic heading
+  const heading =
+    stage === "forgot"
+      ? "Forgot Password"
+      : stage === "reset"
+      ? "Reset Admin Password"
+      : "Admin login";
+
+  // Dynamic description
+  const description =
+    stage === "forgot"
+      ? "Enter your registered admin email address to receive a reset code."
+      : stage === "reset"
+      ? `Enter the 6-digit OTP sent to ${email} and choose a new password.`
+      : "Sign in to manage marketplace listings.";
+
   return (
     <main className="auth-page">
       <section className="auth-card">
 
-        {/* Brand */}
+        {/* BRAND */}
         <Link to="/login" className="auth-brand">
           <span className="brand-icon">C</span>
 
@@ -2489,20 +2814,23 @@ function AdminLogin() {
           </span>
         </Link>
 
-        {/* Heading */}
+        {/* HEADING */}
         <div className="auth-heading">
-          <div className="auth-emoji">🛡️</div>
+          <div className="auth-emoji">
+            {stage === "login" ? "🛡️" : "🔐"}
+          </div>
 
           <p className="eyebrow">ADMINISTRATION</p>
 
-          <h1>Admin login</h1>
+          <h1>{heading}</h1>
 
-          <p>Sign in to manage marketplace listings.</p>
+          <p>{description}</p>
         </div>
 
-        {/* Login Form */}
+        {/* FORM */}
         <form className="auth-form" onSubmit={submit}>
 
+          {/* ADMIN EMAIL */}
           <label htmlFor="admin-email">
             Admin email
           </label>
@@ -2511,58 +2839,164 @@ function AdminLogin() {
             id="admin-email"
             type="email"
             value={email}
-            onChange={(event) => setEmail(event.target.value)}
+            onChange={(event) =>
+              setEmail(event.target.value)
+            }
             placeholder="Enter admin email"
-            autoComplete="username"
+            autoComplete="email"
+            readOnly={stage === "reset"}
             required
           />
 
-          <label htmlFor="admin-password">
-            Password
-          </label>
+          {/* LOGIN PASSWORD */}
+          {stage === "login" && (
+            <>
+              <label htmlFor="admin-password">
+                Password
+              </label>
 
-          <input
-            id="admin-password"
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            placeholder="Enter admin password"
-            autoComplete="current-password"
-            required
-          />
+              <input
+                id="admin-password"
+                type="password"
+                value={password}
+                onChange={(event) =>
+                  setPassword(event.target.value)
+                }
+                placeholder="Enter admin password"
+                autoComplete="current-password"
+                required
+              />
 
-          {/* Error Message */}
+              {/* FORGOT PASSWORD LINK */}
+              <button
+                type="button"
+                className="forgot-password-link"
+                onClick={() => changeStage("forgot")}
+              >
+                Forgot password?
+              </button>
+            </>
+          )}
+
+          {/* RESET PASSWORD FIELDS */}
+          {stage === "reset" && (
+            <>
+              <label htmlFor="admin-reset-otp">
+                Password reset OTP
+              </label>
+
+              <input
+                id="admin-reset-otp"
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                value={otp}
+                onChange={(event) =>
+                  setOtp(
+                    event.target.value
+                      .replace(/\D/g, "")
+                      .slice(0, 6)
+                  )
+                }
+                placeholder="Enter 6-digit OTP"
+                maxLength={6}
+                required
+              />
+
+              <label htmlFor="admin-new-password">
+                New password
+              </label>
+
+              <input
+                id="admin-new-password"
+                type="password"
+                value={newPassword}
+                onChange={(event) =>
+                  setNewPassword(event.target.value)
+                }
+                placeholder="Enter new password"
+                autoComplete="new-password"
+                minLength={8}
+                required
+              />
+
+              <label htmlFor="admin-confirm-password">
+                Confirm new password
+              </label>
+
+              <input
+                id="admin-confirm-password"
+                type="password"
+                value={confirmPassword}
+                onChange={(event) =>
+                  setConfirmPassword(event.target.value)
+                }
+                placeholder="Re-enter new password"
+                autoComplete="new-password"
+                minLength={8}
+                required
+              />
+            </>
+          )}
+
+          {/* SUCCESS MESSAGE */}
+          {notice && (
+            <p className="password-success" role="status">
+              {notice}
+            </p>
+          )}
+
+          {/* ERROR MESSAGE */}
           {error && (
             <p className="form-error" role="alert">
               {error}
             </p>
           )}
 
-          {/* Submit Button */}
+          {/* SUBMIT BUTTON */}
           <button
             type="submit"
             className="button button-primary full-width"
             disabled={loading}
           >
             {loading
-              ? "Signing in..."
+              ? "Please wait..."
+              : stage === "forgot"
+              ? "Send Reset OTP →"
+              : stage === "reset"
+              ? "Reset Password →"
               : "Sign In to Dashboard →"}
           </button>
 
         </form>
 
-        {/* Footer */}
-        <p className="auth-footer">
-          <Link to="/login">
-            ← Back to student login
-          </Link>
-        </p>
+        {/* FOOTER */}
+        {stage !== "login" ? (
+          <p className="auth-footer">
+            <button
+              type="button"
+              onClick={() => {
+                changeStage("login");
+                setOtp("");
+                setNewPassword("");
+                setConfirmPassword("");
+              }}
+            >
+              ← Back to admin login
+            </button>
+          </p>
+        ) : (
+          <p className="auth-footer">
+            <Link to="/login">
+              ← Back to student login
+            </Link>
+          </p>
+        )}
 
       </section>
     </main>
   );
 }
-
 // ============================================================
 // ADMIN DASHBOARD
 // ============================================================
@@ -2575,7 +3009,7 @@ function AdminDashboard() {
   const [loadError, setLoadError] = useState("");
   const [editing, setEditing] = useState(null);
 
-  const actions = useListingActions(setProducts, true);
+  const actions = useListingActions(setProducts, true, true);
 
   // Fetch listings from MongoDB through backend API
   useEffect(() => {
@@ -3109,9 +3543,9 @@ function AppRoutes() {
       <Route
         path="/marketplace"
         element={
-          <ProtectedStudentRoute>
+          <ProtectedMarketplaceRoute>
             <Marketplace />
-          </ProtectedStudentRoute>
+          </ProtectedMarketplaceRoute>
         }
       />
 

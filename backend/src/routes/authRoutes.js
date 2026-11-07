@@ -3,36 +3,48 @@ import express from "express";
 import {
   register,
   login,
+  verifyEmailOtp,
+  forgotPassword,
+  resetPassword,
   changePassword,
 } from "../controllers/authController.js";
 
-import authMiddleware from "../middleware/authMiddleware.js";
-import apiKeyMiddleware from "../middleware/apiKeyMiddleware.js";
+import { protect } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
+// Registration
 router.post("/register", register);
+
+// Email verification
+router.post("/verify-email-otp", verifyEmailOtp);
+
+// Login
 router.post("/login", login);
 
-router.get("/me", authMiddleware, (req, res) => {
-  res.status(200).json({
-    message: "Profile fetched successfully",
-    user: {
-      id: req.user._id,
-      name: req.user.name,
-      email: req.user.email,
-      role: req.user.role,
-    },
-  });
-});
+// Student password recovery
+router.post("/forgot-password", (req, res, next) => {
+  req.resetRole = "student";
+  next();
+}, forgotPassword);
 
-router.post("/change-password", authMiddleware, changePassword);
+router.post("/reset-password", (req, res, next) => {
+  req.resetRole = "student";
+  next();
+}, resetPassword);
 
-router.get("/secure-data", apiKeyMiddleware, (req, res) => {
-  res.status(200).json({
-    message: "API key verified successfully",
-    data: "Welcome to Campus Exchange secure API",
-  });
-});
+// Admin password recovery
+router.post("/admin/forgot-password", (req, res, next) => {
+  req.resetRole = "admin";
+  next();
+}, forgotPassword);
+
+router.post("/admin/reset-password", (req, res, next) => {
+  req.resetRole = "admin";
+  next();
+}, resetPassword);
+
+// Change password (requires login)
+router.put("/change-password", protect, changePassword);
 
 export default router;
