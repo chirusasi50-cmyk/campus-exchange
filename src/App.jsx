@@ -1709,8 +1709,9 @@ function ProductCard({ product, onEdit, onDelete }) {
               : alert("No contact number is available for this listing.")
           }
         >
-          Contact Seller
+                    Contact Seller
         </button>
+        )}
 
         {(onEdit || onDelete) && (
           <div className="product-management-actions">
