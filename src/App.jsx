@@ -1696,7 +1696,7 @@ function ProductCard({ product, onEdit, onDelete }) {
 
           <span>{product.seller || "Student Seller"}</span>
         </div>
-
+        {!onEdit && (
         <button
           type="button"
           className="button button-secondary product-contact"
