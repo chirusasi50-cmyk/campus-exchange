@@ -9,23 +9,33 @@ import jwt from "jsonwebtoken";
 
 import connectDB from "./config/db.js";
 import User from "./models/User.js";
+
 import authRoutes from "./routes/authRoutes.js";
 import listingRoutes from "./routes/listingRoutes.js";
+import chatRoutes from "./routes/chatRoutes.js";
+
+// ========================================
+// EXPRESS APP AND HTTP SERVER
+// ========================================
 
 const app = express();
 const httpServer = createServer(app);
 
 app.set("trust proxy", 1);
 
-// Allowed frontend origins
+// ========================================
+// CORS CONFIGURATION
+// ========================================
+
 const allowedOrigins = [
   process.env.CLIENT_URL,
   "http://localhost:5173",
 ]
   .filter(Boolean)
-  .flatMap((origin) => origin.split(",").map((item) => item.trim()));
+  .flatMap((origin) =>
+    origin.split(",").map((item) => item.trim())
+  );
 
-// CORS configuration
 const corsOptions = {
   origin(origin, callback) {
     if (!origin || allowedOrigins.includes(origin)) {
@@ -34,18 +44,32 @@ const corsOptions = {
 
     return callback(new Error("Not allowed by CORS"));
   },
+
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-api-key"],
+
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "x-api-key",
+  ],
+
   credentials: true,
 };
 
 app.use(cors(corsOptions));
 
-// Security middleware
+// ========================================
+// SECURITY MIDDLEWARE
+// ========================================
+
 app.use(helmet());
+
 app.use(express.json({ limit: "3mb" }));
 
-// Rate limiting
+// ========================================
+// RATE LIMITING
+// ========================================
+
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -55,7 +79,10 @@ app.use(
   })
 );
 
-// Socket.IO configuration
+// ========================================
+// SOCKET.IO CONFIGURATION
+// ========================================
+
 const io = new Server(httpServer, {
   cors: {
     origin: allowedOrigins,
@@ -64,7 +91,10 @@ const io = new Server(httpServer, {
   },
 });
 
-// Socket authentication using JWT
+// ========================================
+// SOCKET.IO JWT AUTHENTICATION
+// ========================================
+
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth?.token;
@@ -74,10 +104,15 @@ io.use(async (socket, next) => {
     }
 
     if (!process.env.JWT_SECRET) {
-      return next(new Error("Server authentication configuration error"));
+      return next(
+        new Error("Server authentication configuration error")
+      );
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET
+    );
 
     const user = await User.findById(decoded.id);
 
@@ -95,10 +130,14 @@ io.use(async (socket, next) => {
   }
 });
 
-// Connected users join their private user room
+// ========================================
+// SOCKET CONNECTION
+// ========================================
+
 io.on("connection", (socket) => {
   const userId = socket.data.userId;
 
+  // Join private user room
   socket.join(`user:${userId}`);
 
   console.log(`Chat socket connected: ${userId}`);
@@ -108,17 +147,23 @@ io.on("connection", (socket) => {
   });
 });
 
-// Make Socket.IO available to future chat controllers
+// Make Socket.IO available in controllers
 app.set("io", io);
 
-// Root route
+// ========================================
+// ROOT ROUTE
+// ========================================
+
 app.get("/", (req, res) => {
   res.status(200).json({
     message: "Campus Exchange API is running",
   });
 });
 
-// Health check
+// ========================================
+// HEALTH CHECK
+// ========================================
+
 app.get("/api/health", (req, res) => {
   res.status(200).json({
     status: "OK",
@@ -126,18 +171,30 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// API routes
+// ========================================
+// API ROUTES
+// ========================================
+
 app.use("/api/auth", authRoutes);
+
 app.use("/api/listings", listingRoutes);
 
-// 404 handler
+app.use("/api/chat", chatRoutes);
+
+// ========================================
+// 404 HANDLER
+// ========================================
+
 app.use((req, res) => {
   res.status(404).json({
     message: `Route not found: ${req.method} ${req.originalUrl}`,
   });
 });
 
-// Start server
+// ========================================
+// START SERVER
+// ========================================
+
 const startServer = async () => {
   try {
     await connectDB();
@@ -145,11 +202,19 @@ const startServer = async () => {
     const PORT = Number(process.env.PORT) || 5001;
 
     httpServer.listen(PORT, () => {
-      console.log(`Campus Exchange API running on port ${PORT}`);
+      console.log(
+        `Campus Exchange API running on port ${PORT}`
+      );
+
       console.log("Socket.IO server initialized");
+      console.log("Chat API routes initialized");
     });
   } catch (error) {
-    console.error("Failed to start Campus Exchange API:", error.message);
+    console.error(
+      "Failed to start Campus Exchange API:",
+      error.message
+    );
+
     process.exit(1);
   }
 };
