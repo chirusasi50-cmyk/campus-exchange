@@ -1,45 +1,45 @@
 import mongoose from "mongoose";
+
 const conversationSchema = new mongoose.Schema(
-{
-listing: {
-type: mongoose.Schema.Types.ObjectId,
-ref: “Listing”,
-required: true,
-},
+  {
+    listing: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Listing",
+      required: true,
+    },
 
-buyer: {
-  type: mongoose.Schema.Types.ObjectId,
-  ref: "User",
-  required: true,
-},
-seller: {
-  type: mongoose.Schema.Types.ObjectId,
-  ref: "User",
-  required: true,
-},
-lastMessage: {
-  type: mongoose.Schema.Types.ObjectId,
-  ref: "Message",
-  default: null,
-},
-lastMessageAt: {
-  type: Date,
-  default: Date.now,
-},
+    buyer: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
 
-},
-{ timestamps: true }
+    seller: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+
+    lastMessage: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Message",
+      default: null,
+    },
+
+    lastMessageAt: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+  { timestamps: true }
 );
 
-// Prevent duplicate conversations for the same buyer and listing.
+// Prevent duplicate conversations.
 conversationSchema.index(
-{ listing: 1, buyer: 1, seller: 1 },
-{ unique: true }
+  { listing: 1, buyer: 1, seller: 1 },
+  { unique: true }
 );
 
-const Conversation = mongoose.model(
-“Conversation”,
-conversationSchema
-);
+const Conversation = mongoose.model("Conversation", conversationSchema);
 
 export default Conversation;
