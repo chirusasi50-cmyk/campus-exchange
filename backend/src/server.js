@@ -27,15 +27,19 @@ app.set("trust proxy", 1);
 // CORS CONFIGURATION
 // ========================================
 
-const allowedOrigins = [
+const rawOrigins = [
   process.env.CLIENT_URL,
   "http://localhost:5173",
   "http://localhost:5174",
-]
+];
+
+const allowedOrigins = rawOrigins
   .filter(Boolean)
   .flatMap((origin) =>
     origin.split(",").map((item) => item.trim())
   );
+
+console.log("Allowed CORS origins:", allowedOrigins);
 
 const corsOptions = {
   origin(origin, callback) {
@@ -43,6 +47,7 @@ const corsOptions = {
       return callback(null, true);
     }
 
+    console.error("Blocked CORS origin:", origin);
     return callback(new Error("Not allowed by CORS"));
   },
 
@@ -125,9 +130,12 @@ io.use(async (socket, next) => {
     socket.data.userName = user.name;
     socket.data.userRole = user.role;
 
-    next();
+    return next();
   } catch (error) {
-    next(new Error("Invalid or expired authentication token"));
+    console.error("Socket authentication error:", error.message);
+    return next(
+      new Error("Invalid or expired authentication token")
+    );
   }
 });
 
@@ -138,7 +146,6 @@ io.use(async (socket, next) => {
 io.on("connection", (socket) => {
   const userId = socket.data.userId;
 
-  // Join private user room
   socket.join(`user:${userId}`);
 
   console.log(`Chat socket connected: ${userId}`);
@@ -177,9 +184,7 @@ app.get("/api/health", (req, res) => {
 // ========================================
 
 app.use("/api/auth", authRoutes);
-
 app.use("/api/listings", listingRoutes);
-
 app.use("/api/chat", chatRoutes);
 
 // ========================================
