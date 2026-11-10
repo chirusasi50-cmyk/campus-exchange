@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   BrowserRouter,
   Routes,
@@ -10,6 +10,8 @@ import {
   useParams,
 } from "react-router-dom";
 import "./App.css";
+import { io } from "socket.io-client";
+import ProfileCardsDemo from "./ProfileCardsDemo.jsx";
 const checkPasswordStrength = (password) => {
   let score = 0;
 
@@ -1645,7 +1647,7 @@ function StudentProfile() {
 // PRODUCT CARD
 // ============================================================
 
-function ProductCard({ product, onEdit, onDelete }) {
+function ProductCard({ product, onEdit, onDelete, onChat }) {
   return (
     <article className="product-card">
       <div className="product-image">
@@ -1696,21 +1698,30 @@ function ProductCard({ product, onEdit, onDelete }) {
 
           <span>{product.seller || "Student Seller"}</span>
         </div>
-        {!onEdit && (
-        <button
-          type="button"
-          className="button button-secondary product-contact"
-          onClick={() =>
-            product.contact
-              ? (window.location.href = `tel:${product.contact.replace(
-                  /[^\d+]/g,
-                  ""
-                )}`)
-              : alert("No contact number is available for this listing.")
-          }
-        >
-                    Contact Seller
-        </button>
+
+        {onChat ? (
+          <button
+            type="button"
+            className="button button-primary product-contact"
+            onClick={() => onChat(product)}
+          >
+            💬 Let's Chat
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="button button-secondary product-contact"
+            onClick={() =>
+              product.contact
+                ? (window.location.href = `tel:${product.contact.replace(
+                    /[^\d+]/g,
+                    ""
+                  )}`)
+                : alert("No contact number is available for this listing.")
+            }
+          >
+            Contact Seller
+          </button>
         )}
 
         {(onEdit || onDelete) && (
@@ -2385,6 +2396,40 @@ function Marketplace() {
 
   const actions = useListingActions(setProducts, true, isAdmin);
 
+  async function startChat(product) {
+    const token = sessionStorage.getItem("campusExchangeToken");
+    if (!token) {
+      navigate("/login");
+      return;
+    }
+
+    const listingId = product._id || product.id;
+    if (!listingId || !/^[a-f\\d]{24}$/i.test(String(listingId))) {
+      alert("This listing is not available for chat yet. Please refresh the marketplace.");
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/chat/conversations`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ listingId }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.message || "Unable to start chat.");
+      }
+      const conversationId = data.conversation?._id;
+      if (!conversationId) throw new Error("The server did not return a conversation.");
+      navigate(`/chat/${conversationId}`);
+    } catch (error) {
+      alert(error.message || "Unable to start chat.");
+    }
+  }
+
   useEffect(() => {
     let active = true;
     fetchListings()
@@ -2557,6 +2602,7 @@ function Marketplace() {
                 product={product}
                 onEdit={isAdmin || product.owner?._id === sessionStorage.getItem("campusExchangeStudentId") ? setEditing : undefined}
                 onDelete={isAdmin || product.owner?._id === sessionStorage.getItem("campusExchangeStudentId") ? actions.deleteProduct : undefined}
+                onChat={!isAdmin && product.owner?._id && product.owner?._id !== sessionStorage.getItem("campusExchangeStudentId") ? startChat : undefined}
               />
             ))}
           </section>
@@ -3509,6 +3555,347 @@ function CampusBlockDashboard() {
   );
 }
 
+
+// ============================================================
+// STUDENT CHAT
+// ============================================================
+
+function ChatPage() {
+  const navigate = useNavigate();
+  const { conversationId: routeConversationId } = useParams();
+  const [conversations, setConversations] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [activeConversation, setActiveConversation] = useState(null);
+  const [draft, setDraft] = useState("");
+  const [editingMessageId, setEditingMessageId] = useState(null);
+  const [editingText, setEditingText] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState("");
+  const [socketStatus, setSocketStatus] = useState("connecting");
+  const socketRef = useRef(null);
+  const bottomRef = useRef(null);
+  const token = sessionStorage.getItem("campusExchangeToken");
+  const currentUserId = sessionStorage.getItem("campusExchangeStudentId");
+
+  const chatRequest = async (path, options = {}) => {
+    const response = await fetch(`${API_BASE_URL}/chat${path}`, {
+      ...options,
+      headers: {
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        Authorization: `Bearer ${token}`,
+        ...options.headers,
+      },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.message || "Chat request failed.");
+    return data;
+  };
+
+  const loadConversations = async () => {
+    const data = await chatRequest("/conversations");
+    setConversations(data.conversations || []);
+    return data.conversations || [];
+  };
+
+  const loadMessages = async (id) => {
+    if (!id) {
+      setMessages([]);
+      setActiveConversation(null);
+      return;
+    }
+    const [messageData, conversationData] = await Promise.all([
+      chatRequest(`/conversations/${id}/messages`),
+      chatRequest("/conversations"),
+    ]);
+    const list = conversationData.conversations || [];
+    setConversations(list);
+    setActiveConversation(list.find((item) => item._id === id) || null);
+    setMessages(messageData.messages || []);
+    await chatRequest(`/conversations/${id}/read`, { method: "PATCH" });
+  };
+
+  useEffect(() => {
+    if (!token) {
+      navigate("/login", { replace: true });
+      return;
+    }
+    let alive = true;
+    setLoading(true);
+    loadConversations()
+      .then((list) => {
+        if (!alive) return;
+        if (routeConversationId) return loadMessages(routeConversationId);
+        if (list.length) navigate(`/chat/${list[0]._id}`, { replace: true });
+      })
+      .catch((err) => {
+        if (alive) setError(err.message || "Unable to load chats.");
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => { alive = false; };
+  }, [routeConversationId]);
+
+  useEffect(() => {
+    if (!token) return undefined;
+    const socket = io(
+      (import.meta.env.VITE_API_URL || "http://localhost:5001").replace(/\/$/, ""),
+      { auth: { token }, transports: ["websocket", "polling"] }
+    );
+    socketRef.current = socket;
+    socket.on("connect", () => setSocketStatus("connected"));
+    socket.on("disconnect", () => setSocketStatus("disconnected"));
+    socket.on("connect_error", () => setSocketStatus("disconnected"));
+
+    const belongsToActive = (message) => {
+      const id = message?.conversation?._id || message?.conversation;
+      return String(id) === String(routeConversationId);
+    };
+    socket.on("message:new", (message) => {
+      if (belongsToActive(message)) {
+        setMessages((current) => current.some((item) => item._id === message._id) ? current : [...current, message]);
+        chatRequest(`/conversations/${routeConversationId}/read`, { method: "PATCH" }).catch(() => {});
+      }
+      loadConversations().catch(() => {});
+    });
+    socket.on("message:edited", (message) => {
+      if (belongsToActive(message)) {
+        setMessages((current) => current.map((item) => item._id === message._id ? message : item));
+      }
+    });
+    socket.on("message:deleted", (message) => {
+      if (belongsToActive(message)) {
+        setMessages((current) => current.map((item) => item._id === message._id ? { ...item, ...message } : item));
+      }
+    });
+    socket.on("messages:read", (event) => {
+      if (String(event.conversationId) === String(routeConversationId)) {
+        setMessages((current) => current.map((item) =>
+          item.sender?._id === currentUserId && !item.readAt
+            ? { ...item, readAt: event.readAt }
+            : item
+        ));
+      }
+    });
+    return () => {
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, [token, routeConversationId]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  async function sendMessage(event) {
+    event.preventDefault();
+    const content = draft.trim();
+    if (!content || !routeConversationId || sending) return;
+    setSending(true);
+    setError("");
+    try {
+      const data = await chatRequest(`/conversations/${routeConversationId}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ content }),
+      });
+      setMessages((current) => current.some((item) => item._id === data.newMessage._id) ? current : [...current, data.newMessage]);
+      setDraft("");
+      loadConversations().catch(() => {});
+    } catch (err) {
+      setError(err.message || "Unable to send message.");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function saveEdit(messageId) {
+    const content = editingText.trim();
+    if (!content) return;
+    try {
+      const data = await chatRequest(`/messages/${messageId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ content }),
+      });
+      setMessages((current) => current.map((item) => item._id === messageId ? data.updatedMessage : item));
+      setEditingMessageId(null);
+      setEditingText("");
+    } catch (err) {
+      setError(err.message || "Unable to edit message.");
+    }
+  }
+
+  async function deleteMessage(messageId) {
+    if (!window.confirm("Delete this message?")) return;
+    try {
+      await chatRequest(`/messages/${messageId}`, { method: "DELETE" });
+      setMessages((current) => current.map((item) =>
+        item._id === messageId
+          ? { ...item, content: "This message was deleted", isDeleted: true, edited: false }
+          : item
+      ));
+    } catch (err) {
+      setError(err.message || "Unable to delete message.");
+    }
+  }
+
+  const otherParticipant = activeConversation
+    ? (String(activeConversation.buyer?._id) === String(currentUserId)
+        ? activeConversation.seller
+        : activeConversation.buyer)
+    : null;
+
+  return (
+    <div className="app-page chat-page">
+      <Header />
+      <main className="chat-shell">
+        <aside className="chat-sidebar">
+          <div className="chat-sidebar-heading">
+            <div>
+              <p className="eyebrow">CAMPUS EXCHANGE</p>
+              <h1>Messages</h1>
+            </div>
+            <span className={`chat-connection ${socketStatus}`} title={socketStatus}>
+              {socketStatus === "connected" ? "● Online" : "● Connecting"}
+            </span>
+          </div>
+          {loading ? <p className="muted-text">Loading conversations…</p> : conversations.length === 0 ? (
+            <div className="chat-empty-list">
+              <span>💬</span>
+              <h3>No conversations yet</h3>
+              <p>Open a marketplace listing and select Let's Chat to contact its seller.</p>
+              <button className="button button-primary" onClick={() => navigate("/marketplace")}>Browse marketplace</button>
+            </div>
+          ) : conversations.map((conversation) => {
+            const isBuyer = String(conversation.buyer?._id) === String(currentUserId);
+            const person = isBuyer ? conversation.seller : conversation.buyer;
+            const selected = conversation._id === routeConversationId;
+            return (
+              <button
+                type="button"
+                key={conversation._id}
+                className={`chat-conversation-item ${selected ? "active" : ""}`}
+                onClick={() => navigate(`/chat/${conversation._id}`)}
+              >
+                <span className="chat-avatar">{(person?.name || "S").charAt(0).toUpperCase()}</span>
+                <span className="chat-conversation-copy">
+                  <strong>{person?.name || "Student"}</strong>
+                  <small>{conversation.listing?.title || "Marketplace item"}</small>
+                  <small className="chat-last-message">{conversation.lastMessage?.content || "Start a conversation"}</small>
+                </span>
+              </button>
+            );
+          })}
+        </aside>
+
+        <section className="chat-main">
+          {!routeConversationId ? (
+            <div className="chat-welcome">
+              <span>💬</span>
+              <h2>Your campus conversations</h2>
+              <p>Select a conversation or start chatting from a marketplace listing.</p>
+            </div>
+          ) : (
+            <>
+              <header className="chat-header">
+                <button className="chat-back-button" onClick={() => navigate("/chat")} aria-label="Back to conversations">←</button>
+                <span className="chat-avatar">{(otherParticipant?.name || "S").charAt(0).toUpperCase()}</span>
+                <div>
+                  <strong>{otherParticipant?.name || "Student"}</strong>
+                  <small>{activeConversation?.listing?.title || "Marketplace conversation"}</small>
+                </div>
+              </header>
+              {error && <p className="form-error chat-error" role="alert">{error}</p>}
+              <div className="chat-message-list">
+                {messages.map((message) => {
+                  const mine = String(message.sender?._id || message.sender) === String(currentUserId);
+                  return (
+                    <div key={message._id} className={`chat-message-row ${mine ? "mine" : "theirs"}`}>
+                      <div className="chat-bubble">
+                        {editingMessageId === message._id ? (
+                          <div className="chat-edit-form">
+                            <textarea value={editingText} onChange={(event) => setEditingText(event.target.value)} maxLength={2000} />
+                            <div>
+                              <button onClick={() => saveEdit(message._id)}>Save</button>
+                              <button onClick={() => setEditingMessageId(null)}>Cancel</button>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <p>{message.content}</p>
+                            <div className="chat-message-meta">
+                              <small>{new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small>
+                              {message.edited && !message.isDeleted && <small> · edited</small>}
+                              {mine && message.readAt && <small> · ✓✓ Read</small>}
+                            </div>
+                            {mine && !message.isDeleted && (
+                              <div className="chat-message-actions">
+                                <button onClick={() => { setEditingMessageId(message._id); setEditingText(message.content); }}>Edit</button>
+                                <button onClick={() => deleteMessage(message._id)}>Delete</button>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+                <div ref={bottomRef} />
+              </div>
+              <form className="chat-compose" onSubmit={sendMessage}>
+                <textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Type a message…" maxLength={2000} rows={1} />
+                <button className="button button-primary" type="submit" disabled={sending || !draft.trim()}>
+                  {sending ? "Sending…" : "Send"}
+                </button>
+              </form>
+            </>
+          )}
+        </section>
+      </main>
+      <style>{`
+        .chat-shell{max-width:1200px;height:min(760px,calc(100vh - 150px));min-height:520px;margin:32px auto;padding:0 22px;display:grid;grid-template-columns:340px 1fr;gap:0}
+        .chat-sidebar,.chat-main{background:#fff;border:1px solid #e5e7eb;min-height:0}
+        .chat-sidebar{border-radius:18px 0 0 18px;overflow:auto}
+        .chat-sidebar-heading{padding:22px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #edf0f2}
+        .chat-sidebar-heading h1{margin:4px 0;font-size:25px}
+        .chat-connection{font-size:12px;color:#64748b;white-space:nowrap}
+        .chat-connection.connected{color:#159447}
+        .chat-conversation-item{width:100%;display:flex;gap:12px;text-align:left;padding:16px;border:0;border-bottom:1px solid #f0f2f4;background:#fff;cursor:pointer}
+        .chat-conversation-item.active,.chat-conversation-item:hover{background:#f0f8f5}
+        .chat-avatar{width:42px;height:42px;flex:0 0 42px;border-radius:50%;display:grid;place-items:center;background:#dff3e9;color:#16734b;font-weight:700}
+        .chat-conversation-copy{min-width:0;display:flex;flex-direction:column;gap:4px}
+        .chat-conversation-copy strong{color:#172b25}
+        .chat-conversation-copy small{color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px}
+        .chat-last-message{font-size:12px}
+        .chat-main{border-radius:0 18px 18px 0;display:flex;flex-direction:column;overflow:hidden}
+        .chat-header{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid #edf0f2}
+        .chat-header div{display:flex;flex-direction:column;gap:3px}
+        .chat-header small{color:#64748b}
+        .chat-back-button{border:0;background:transparent;font-size:25px;cursor:pointer}
+        .chat-message-list{flex:1;overflow:auto;padding:22px;background:#f7faf8}
+        .chat-message-row{display:flex;margin:10px 0}
+        .chat-message-row.mine{justify-content:flex-end}
+        .chat-bubble{max-width:min(75%,520px);padding:10px 13px;border-radius:15px;background:#fff;box-shadow:0 1px 2px #00000010;overflow-wrap:anywhere}
+        .chat-message-row.mine .chat-bubble{background:#dcf8e9}
+        .chat-bubble p{margin:0;white-space:pre-wrap}
+        .chat-message-meta{display:flex;justify-content:flex-end;gap:3px;margin-top:5px;color:#64748b;font-size:11px}
+        .chat-message-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:5px}
+        .chat-message-actions button,.chat-edit-form button{border:0;background:transparent;color:#16734b;font-size:12px;cursor:pointer}
+        .chat-compose{display:flex;gap:10px;padding:14px;border-top:1px solid #edf0f2}
+        .chat-compose textarea{flex:1;resize:vertical;min-height:42px;max-height:120px;border:1px solid #d7dee2;border-radius:12px;padding:11px;font:inherit}
+        .chat-empty-list,.chat-welcome{padding:32px;text-align:center;color:#64748b}
+        .chat-empty-list span,.chat-welcome span{font-size:40px}
+        .chat-empty-list h3,.chat-welcome h2{color:#172b25}
+        .chat-welcome{margin:auto}
+        .chat-error{margin:8px 18px 0}
+        .chat-edit-form textarea{width:100%;min-width:220px;min-height:70px;border:1px solid #cbd5e1;border-radius:8px;padding:8px;font:inherit}
+        .chat-edit-form div{display:flex;justify-content:flex-end;gap:10px;margin-top:6px}
+        @media(max-width:760px){.chat-shell{height:calc(100vh - 125px);min-height:450px;margin:14px auto;padding:0 10px;grid-template-columns:1fr}.chat-sidebar{border-radius:16px 16px 0 0;max-height:220px}.chat-main{border-radius:0 0 16px 16px}.chat-conversation-item{padding:10px}.chat-message-list{padding:12px}.chat-bubble{max-width:88%}}
+      `}</style>
+    </div>
+  );
+}
+
 // ============================================================
 // APP ROUTES
 // ============================================================
@@ -3516,6 +3903,8 @@ function CampusBlockDashboard() {
 function AppRoutes() {
   return (
     <Routes>
+      <Route path="/profiles-demo" element={<ProfileCardsDemo />} />
+
       <Route
         path="/"
         element={<Navigate to="/login" replace />}
@@ -3547,6 +3936,24 @@ function AppRoutes() {
           <ProtectedMarketplaceRoute>
             <Marketplace />
           </ProtectedMarketplaceRoute>
+        }
+      />
+
+      <Route
+        path="/chat"
+        element={
+          <ProtectedStudentRoute>
+            <ChatPage />
+          </ProtectedStudentRoute>
+        }
+      />
+
+      <Route
+        path="/chat/:conversationId"
+        element={
+          <ProtectedStudentRoute>
+            <ChatPage />
+          </ProtectedStudentRoute>
         }
       />
 
