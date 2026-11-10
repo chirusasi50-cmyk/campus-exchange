@@ -44,6 +44,50 @@ const hashOtp = (otp) => {
 // ========================================
 
 const sendOtpEmail = async (email, otp, purpose) => {
+  const apiKey = process.env.RESEND_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("RESEND_API_KEY is missing");
+  }
+
+  const isVerification = purpose === "verify";
+
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: process.env.EMAIL_FROM || "onboarding@resend.dev",
+      to: [email],
+      subject: isVerification
+        ? "Campus Exchange - Email Verification"
+        : "Campus Exchange - Password Reset",
+      text: `Your OTP is ${otp}. It expires in 10 minutes.`,
+      html: `
+        <div style="font-family:Arial;padding:20px">
+          <h2>Campus Exchange</h2>
+          <p>Your ${
+            isVerification ? "email verification" : "password reset"
+          } code is:</p>
+          <h1 style="letter-spacing:5px">${otp}</h1>
+          <p>This OTP expires in 10 minutes.</p>
+          <p>If you did not request this code, ignore this email.</p>
+        </div>
+      `,
+    }),
+  });
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    console.error("Resend API error:", result);
+    throw new Error(result.message || "Failed to send OTP email");
+  }
+
+  console.log("OTP email sent successfully:", result.id);
+};
   const {
     SMTP_HOST,
     SMTP_PORT,
