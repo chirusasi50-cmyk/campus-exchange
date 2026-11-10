@@ -33,6 +33,8 @@ const allowedOrigins = [
   "http://localhost:5174",
 ]
   .filter(Boolean)
+  .flatMap((origin) => origin.split(",").map((item) => item.trim()));
+  .filter(Boolean)
   .flatMap((origin) =>
     origin.split(",").map((item) => item.trim())
   );
