@@ -13,19 +13,19 @@ import "./App.css";
 import { io } from "socket.io-client";
 import ProfileCardsDemo from "./ProfileCardsDemo.jsx";
 const checkPasswordStrength = (password) => {
-  let score = 0;
+  const hasLetters = /[A-Za-z]/.test(password);
+  const hasNumbers = /\d/.test(password);
+  const isStrong = password.length >= 8
+    && /[A-Z]/.test(password)
+    && /[a-z]/.test(password)
+    && hasNumbers
+    && /[^A-Za-z0-9]/.test(password);
 
-  if (password.length >= 8) score++;
-  if (/[A-Z]/.test(password)) score++;
-  if (/[a-z]/.test(password)) score++;
-  if (/[0-9]/.test(password)) score++;
-  if (/[^A-Za-z0-9]/.test(password)) score++;
-
-  if (score <= 2) return { level: "Weak", score: 1 };
-  if (score === 3) return { level: "Medium", score: 2 };
-  if (score === 4) return { level: "Strong", score: 3 };
-
-  return { level: "Very Strong", score: 4 };
+  if (isStrong) return { level: "strong", score: 3, label: "Strong password" };
+  if (password.length >= 8 && hasLetters && hasNumbers) {
+    return { level: "medium", score: 2, label: "Medium password" };
+  }
+  return { level: "weak", score: 1, label: "Weak password" };
 };
 
 const STUDENT_AUTH_KEY = "campusExchangeStudentDemo";
@@ -34,14 +34,139 @@ const LISTINGS_KEY = "campusExchangeAdminListings";
 const PROFILE_KEY = "campusExchangeStudentProfile";
 const BLOCKS = ["A", "H", "N", "U", "P"];
 const CATEGORIES = ["Books", "Electronics", "Accessories", "Other"];
-const API_BASE_URL = `${(import.meta.env.VITE_API_URL || "http://localhost:5001").replace(/\/$/, "")}/api`;
+const API_ORIGIN = (import.meta.env.VITE_API_URL || "http://localhost:5001").replace(/\/+$/, "").replace(/\/api$/i, "");
+const API_BASE_URL = `${API_ORIGIN}/api`;
+const MAX_CHAT_FILE_SIZE = 10 * 1024 * 1024;
+const CHAT_FILE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "application/pdf"]);
+
+async function apiFetch(url, options) {
+  try {
+    return await fetch(url, options);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(`Cannot reach the backend at ${API_BASE_URL}. Check that it is running and allows this page origin (${window.location.origin}).`);
+    }
+    throw error;
+  }
+}
+
+function currentToken() {
+  return sessionStorage.getItem("adminToken") || sessionStorage.getItem("campusExchangeToken");
+}
+
+function normalizeId(value) {
+  if (value === null || value === undefined) return "";
+  const id = typeof value === "object" && value !== null && "_id" in value
+    ? value._id
+    : value;
+  return id === null || id === undefined ? "" : String(id);
+}
+
+function upsertMessage(messages, nextMessage) {
+  const nextId = normalizeId(nextMessage?._id);
+  const index = messages.findIndex((message) => normalizeId(message._id) === nextId);
+  if (index === -1) return [...messages, nextMessage];
+  const updated = [...messages];
+  updated[index] = nextMessage;
+  return updated;
+}
+
+function mergeMessageLists(serverMessages, currentMessages) {
+  const merged = new Map((serverMessages || []).map((message) => [normalizeId(message._id), message]));
+  currentMessages.forEach((current) => {
+    const id = normalizeId(current._id);
+    const server = merged.get(id);
+    if (!server) {
+      merged.set(id, current);
+      return;
+    }
+    const currentEditTime = current.editedAt ? new Date(current.editedAt).getTime() : 0;
+    const serverEditTime = server.editedAt ? new Date(server.editedAt).getTime() : 0;
+    const deletedAt = server.deletedAt || current.deletedAt;
+    merged.set(id, {
+      ...server,
+      text: deletedAt ? "This message was deleted" : currentEditTime > serverEditTime ? current.text : server.text,
+      editedAt: currentEditTime > serverEditTime ? current.editedAt : server.editedAt,
+      deletedAt,
+      deliveredAt: server.deliveredAt || current.deliveredAt,
+      readAt: server.readAt || current.readAt,
+    });
+  });
+  return [...merged.values()].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+}
+
+async function chatRequest(path, options = {}) {
+  const token = currentToken();
+  const response = await apiFetch(`${API_BASE_URL}/chat${path}`, {
+    ...options,
+    headers: {
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...options.headers,
+    },
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.message || `Chat request failed (${response.status}).`);
+  return data;
+}
+
+function uploadChatFile(conversationId, file, text, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const form = new FormData();
+    form.append("text", text);
+    form.append("file", file, file.name);
+    xhr.open("POST", `${API_BASE_URL}/chat/conversations/${conversationId}/attachments`);
+    const token = currentToken();
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
+    });
+    xhr.addEventListener("load", () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText || "{}"); } catch { /* keep a useful fallback */ }
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(data);
+      return reject(new Error(data.message || `Upload failed (${xhr.status}).`));
+    });
+    xhr.addEventListener("error", () => reject(new Error(`Cannot upload to ${API_BASE_URL}. Check the backend and CORS settings.`)));
+    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled.")));
+    xhr.send(form);
+  });
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function attachmentContentUrl(attachment) {
+  return `${API_ORIGIN}${attachment.url}`;
+}
+
+async function downloadChatAttachment(attachment) {
+  const response = await apiFetch(`${attachmentContentUrl(attachment)}?download=1`, {
+    headers: { Authorization: `Bearer ${currentToken()}` },
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.message || "Unable to download this attachment.");
+  }
+  const objectUrl = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = attachment.filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}
 
 async function listingRequest(path, options = {}) {
   const isAdmin = sessionStorage.getItem(ADMIN_AUTH_KEY) === "true";
   const token = isAdmin
     ? sessionStorage.getItem("adminToken")
     : sessionStorage.getItem("campusExchangeToken");
-  const response = await fetch(`${API_BASE_URL}/listings${path}`, {
+  const response = await apiFetch(`${API_BASE_URL}/listings${path}`, {
     ...options,
     headers: {
       ...(options.body ? { "Content-Type": "application/json" } : {}),
@@ -337,6 +462,10 @@ function Header() {
           Marketplace
         </Link>
 
+        <Link to="/messages" className="nav-link">
+          Messages
+        </Link>
+
         <Link to="/campus-blocks" className="nav-link">
           Campus Blocks
         </Link>
@@ -383,6 +512,7 @@ function StudentLogin() {
   const [loading, setLoading] = useState(false);
 
   const isRegister = mode === "register";
+  const passwordStrength = password ? checkPasswordStrength(password) : null;
 
   function switchMode(nextMode) {
     setMode(nextMode);
@@ -396,7 +526,7 @@ function StudentLogin() {
 
   // API request helper
   async function authRequest(endpoint, payload) {
-    const response = await fetch(
+    const response = await apiFetch(
       `${API_BASE_URL}/auth/${endpoint}`,
       {
         method: "POST",
@@ -804,6 +934,26 @@ function StudentLogin() {
 
               </div>
 
+              {isRegister && stage === "auth" && passwordStrength && (
+                <div
+                  className={`password-strength password-strength-${passwordStrength.level}`}
+                  role="meter"
+                  aria-label="Password strength"
+                  aria-valuemin={1}
+                  aria-valuemax={3}
+                  aria-valuenow={passwordStrength.score}
+                  aria-valuetext={passwordStrength.label}
+                >
+                  <div className="strength-track" aria-hidden="true">
+                    <div
+                      className="strength-fill"
+                      style={{ width: `${(passwordStrength.score / 3) * 100}%` }}
+                    />
+                  </div>
+                  <p className="strength-label" aria-live="polite">{passwordStrength.label}</p>
+                </div>
+              )}
+
               {/* CONFIRM PASSWORD */}
               {(isRegister || stage === "reset") && (
                 <>
@@ -1129,6 +1279,60 @@ function StudentProfile() {
   const [editing, setEditing] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmNewPassword, setConfirmNewPassword] = useState("");
+  const [passwordChangeError, setPasswordChangeError] = useState("");
+  const [passwordChangeSuccess, setPasswordChangeSuccess] = useState("");
+  const [passwordChangeLoading, setPasswordChangeLoading] = useState(false);
+
+  async function submitPasswordChange(event) {
+    event.preventDefault();
+    setPasswordChangeError("");
+    setPasswordChangeSuccess("");
+
+    if (!currentPassword || !newPassword || !confirmNewPassword) {
+      setPasswordChangeError("Fill in all three password fields.");
+      return;
+    }
+    if (newPassword.length < 8) {
+      setPasswordChangeError("Your new password must be at least 8 characters.");
+      return;
+    }
+    if (newPassword !== confirmNewPassword) {
+      setPasswordChangeError("The new passwords do not match.");
+      return;
+    }
+
+    const token = sessionStorage.getItem("adminToken") || sessionStorage.getItem("campusExchangeToken");
+    if (!token) {
+      setPasswordChangeError("Please log in again before changing your password.");
+      return;
+    }
+
+    setPasswordChangeLoading(true);
+    try {
+      const response = await apiFetch(`${API_BASE_URL}/auth/change-password`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.message || "Unable to change your password.");
+
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmNewPassword("");
+      setPasswordChangeSuccess(data.message || "Password changed successfully.");
+    } catch (requestError) {
+      setPasswordChangeError(requestError.message || "Unable to change your password.");
+    } finally {
+      setPasswordChangeLoading(false);
+    }
+  }
 
   function change(event) {
     setForm((previous) => ({
@@ -1560,18 +1764,19 @@ function StudentProfile() {
 
   <form
     className="change-password-form"
-    onSubmit={(e) => {
-      e.preventDefault();
-      alert(
-        "Password changing requires backend authentication. Connect the password API to enable this feature securely."
-      );
-    }}
+    onSubmit={submitPasswordChange}
   >
     <div className="password-field">
       <label htmlFor="current-password">Current Password</label>
       <input
         id="current-password"
         type="password"
+        value={currentPassword}
+        onChange={(event) => {
+          setCurrentPassword(event.target.value);
+          setPasswordChangeError("");
+          setPasswordChangeSuccess("");
+        }}
         placeholder="Enter current password"
         autoComplete="current-password"
         required
@@ -1583,6 +1788,12 @@ function StudentProfile() {
       <input
         id="new-password"
         type="password"
+        value={newPassword}
+        onChange={(event) => {
+          setNewPassword(event.target.value);
+          setPasswordChangeError("");
+          setPasswordChangeSuccess("");
+        }}
         placeholder="Enter new password"
         autoComplete="new-password"
         minLength={8}
@@ -1596,6 +1807,12 @@ function StudentProfile() {
       <input
         id="confirm-password"
         type="password"
+        value={confirmNewPassword}
+        onChange={(event) => {
+          setConfirmNewPassword(event.target.value);
+          setPasswordChangeError("");
+          setPasswordChangeSuccess("");
+        }}
         placeholder="Confirm new password"
         autoComplete="new-password"
         minLength={8}
@@ -1603,8 +1820,11 @@ function StudentProfile() {
       />
     </div>
 
-    <button type="submit" className="button button-primary">
-      🔒 Update Password
+    {passwordChangeSuccess && <p className="password-success change-password-feedback" role="status">{passwordChangeSuccess}</p>}
+    {passwordChangeError && <p className="form-error change-password-feedback" role="alert">{passwordChangeError}</p>}
+
+    <button type="submit" className="button button-primary" disabled={passwordChangeLoading}>
+      {passwordChangeLoading ? "Updating…" : "🔒 Update Password"}
     </button>
   </form>
 </section>
@@ -1699,30 +1919,14 @@ function ProductCard({ product, onEdit, onDelete, onChat }) {
           <span>{product.seller || "Student Seller"}</span>
         </div>
 
-        {onChat ? (
-          <button
-            type="button"
-            className="button button-primary product-contact"
-            onClick={() => onChat(product)}
-          >
-            💬 Let's Chat
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="button button-secondary product-contact"
-            onClick={() =>
-              product.contact
-                ? (window.location.href = `tel:${product.contact.replace(
-                    /[^\d+]/g,
-                    ""
-                  )}`)
-                : alert("No contact number is available for this listing.")
-            }
-          >
-            Contact Seller
-          </button>
-        )}
+        <button
+          type="button"
+          className="button button-secondary product-contact"
+          onClick={() => onChat?.(product)}
+          disabled={!onChat}
+        >
+          {onChat ? "Let's Chat" : product.owner?._id === sessionStorage.getItem("campusExchangeStudentId") ? "Your Listing" : "Chat unavailable"}
+        </button>
 
         {(onEdit || onDelete) && (
           <div className="product-management-actions">
@@ -1750,6 +1954,381 @@ function ProductCard({ product, onEdit, onDelete, onChat }) {
       </div>
     </article>
   );
+}
+
+function SecureAttachment({ attachment, onError }) {
+  const [previewUrl, setPreviewUrl] = useState("");
+  const [previewError, setPreviewError] = useState("");
+  const isImage = attachment.mimeType.startsWith("image/");
+  const typeLabel = attachment.mimeType === "application/pdf"
+    ? "PDF document"
+    : `${attachment.mimeType.split("/")[1].toUpperCase()} image`;
+
+  useEffect(() => {
+    if (!isImage) return undefined;
+    let active = true;
+    let objectUrl = "";
+    apiFetch(attachmentContentUrl(attachment), {
+      headers: { Authorization: `Bearer ${currentToken()}` },
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Unable to load this image preview.");
+        return response.blob();
+      })
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob);
+        if (active) setPreviewUrl(objectUrl);
+        else URL.revokeObjectURL(objectUrl);
+      })
+      .catch((error) => { if (active) setPreviewError(error.message); });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [attachment._id, attachment.url, isImage]);
+
+  async function download() {
+    try {
+      await downloadChatAttachment(attachment);
+    } catch (error) {
+      onError(error.message || "Unable to download this attachment.");
+    }
+  }
+
+  return (
+    <div className="chat-attachment">
+      {isImage ? (
+        previewUrl ? <img className="chat-attachment-image" src={previewUrl} alt={attachment.filename} />
+          : <div className="chat-attachment-image-loading">{previewError || "Loading image preview…"}</div>
+      ) : <span className="chat-attachment-file-icon" aria-hidden="true">PDF</span>}
+      <div className="chat-attachment-details">
+        <strong title={attachment.filename}>{attachment.filename}</strong>
+        <span>{typeLabel} · {formatFileSize(attachment.size)}</span>
+      </div>
+      <button type="button" className="chat-attachment-download" onClick={download} aria-label={`Download ${attachment.filename}`}>
+        Download
+      </button>
+    </div>
+  );
+}
+
+function chatDayLabel(value) {
+  const date = new Date(value);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  const key = (item) => `${item.getFullYear()}-${item.getMonth()}-${item.getDate()}`;
+  if (key(date) === key(today)) return "Today";
+  if (key(date) === key(yesterday)) return "Yesterday";
+  return date.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+}
+
+function ChatCenter() {
+  const { conversationId: routeConversationId } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [conversations, setConversations] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [activeId, setActiveId] = useState(new URLSearchParams(location.search).get("conversation") || routeConversationId || "");
+  const [draft, setDraft] = useState("");
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState("");
+  const [uploadProgress, setUploadProgress] = useState(null);
+  const [sending, setSending] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [reactionPickerFor, setReactionPickerFor] = useState("");
+  const [highlightedMessageId, setHighlightedMessageId] = useState("");
+  const bottomRef = useRef(null);
+  const messagesViewportRef = useRef(null);
+  const messageElementsRef = useRef(new Map());
+  const shouldAutoScrollRef = useRef(true);
+  const initialMessageLoadRef = useRef(true);
+  const fileInputRef = useRef(null);
+  const socketRef = useRef(null);
+  const typingTimerRef = useRef(null);
+  const typingActiveRef = useRef(false);
+  const [peerOnline, setPeerOnline] = useState(false);
+  const [peerTyping, setPeerTyping] = useState(false);
+  const myId = sessionStorage.getItem("campusExchangeStudentId") || sessionStorage.getItem("campusExchangeAdminId") || "";
+  const activeConversation = conversations.find((item) => item._id === activeId);
+
+  async function refreshConversations() {
+    const data = await chatRequest("/conversations");
+    setConversations(data.conversations || []);
+  }
+
+  function applyReactions({ conversationId, messageId, reactions }) {
+    if (normalizeId(conversationId) !== normalizeId(activeId)) return;
+    setMessages((current) => current.map((message) => normalizeId(message._id) === normalizeId(messageId)
+      ? { ...message, reactions: reactions || [] }
+      : message));
+  }
+
+  useEffect(() => {
+    let mounted = true;
+    chatRequest("/conversations")
+      .then((data) => { if (mounted) setConversations(data.conversations || []); })
+      .catch((requestError) => { if (mounted) setError(requestError.message); })
+      .finally(() => { if (mounted) setLoading(false); });
+    return () => { mounted = false; };
+  }, []);
+
+  useEffect(() => {
+    const requestedId = new URLSearchParams(location.search).get("conversation") || routeConversationId || "";
+    setActiveId(requestedId);
+  }, [location.search, routeConversationId]);
+
+  useEffect(() => {
+    if (!activeId) { setMessages([]); return undefined; }
+    let mounted = true;
+    setMessages([]);
+    setSearchResults(null);
+    initialMessageLoadRef.current = true;
+    setError("");
+    setPeerOnline(false);
+    setPeerTyping(false);
+    typingActiveRef.current = false;
+    const syncMessages = () => chatRequest(`/conversations/${activeId}/messages`)
+      .then((data) => {
+        if (!mounted) return;
+        setMessages((current) => mergeMessageLists(data.messages, current));
+        shouldAutoScrollRef.current = true;
+        refreshConversations().catch(() => {});
+      })
+      .catch((requestError) => { if (mounted) setError(requestError.message); });
+    syncMessages();
+    const socket = io(API_ORIGIN, {
+      auth: { token: currentToken() },
+      transports: ["websocket", "polling"],
+    });
+    socketRef.current = socket;
+    socket.on("connect", () => {
+      socket.emit("conversation:join", activeId);
+      syncMessages();
+    });
+    socket.on("disconnect", () => {
+      setPeerOnline(false);
+      setPeerTyping(false);
+      if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+      typingTimerRef.current = null;
+      typingActiveRef.current = false;
+    });
+    socket.on("presence:state", ({ conversationId, participants = [] }) => {
+      if (normalizeId(conversationId) !== normalizeId(activeId)) return;
+      const peer = participants.find((participant) => normalizeId(participant.userId) !== normalizeId(myId));
+      setPeerOnline(Boolean(peer?.online));
+    });
+    socket.on("presence:update", ({ conversationId, userId, online }) => {
+      if (normalizeId(conversationId) === normalizeId(activeId) && normalizeId(userId) !== normalizeId(myId)) {
+        setPeerOnline(Boolean(online));
+      }
+    });
+    socket.on("typing:update", ({ conversationId, userId, typing }) => {
+      if (normalizeId(conversationId) === normalizeId(activeId) && normalizeId(userId) !== normalizeId(myId)) {
+        setPeerTyping(Boolean(typing));
+      }
+    });
+    socket.on("message:new", ({ conversationId, message }) => {
+      if (normalizeId(conversationId) === normalizeId(activeId)) {
+        const viewport = messagesViewportRef.current;
+        shouldAutoScrollRef.current = !viewport || viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 140;
+        setMessages((current) => upsertMessage(current, message));
+        if (normalizeId(message.sender) !== normalizeId(myId)) {
+          socket.emit("messages:mark-read", { conversationId });
+        }
+      }
+      refreshConversations().catch(() => {});
+    });
+    socket.on("message:updated", ({ conversationId, message }) => {
+      if (normalizeId(conversationId) === normalizeId(activeId)) {
+        setMessages((current) => upsertMessage(current, message));
+      }
+      refreshConversations().catch(() => {});
+    });
+    socket.on("message:reactions", applyReactions);
+    socket.on("message:receipt", ({ conversationId, messageId, deliveredAt, readAt }) => {
+      if (normalizeId(conversationId) !== normalizeId(activeId)) return;
+      setMessages((current) => current.map((message) => normalizeId(message._id) === normalizeId(messageId)
+        ? { ...message, deliveredAt: deliveredAt || message.deliveredAt, readAt: readAt || message.readAt }
+        : message));
+    });
+    socket.on("messages:read", ({ conversationId, messageIds = [], readAt }) => {
+      if (normalizeId(conversationId) !== normalizeId(activeId)) return;
+      const readIdSet = new Set(messageIds.map(normalizeId));
+      setMessages((current) => current.map((message) => readIdSet.has(normalizeId(message._id))
+        ? { ...message, deliveredAt: message.deliveredAt || readAt, readAt: message.readAt || readAt }
+        : message));
+      refreshConversations().catch(() => {});
+    });
+    return () => {
+      mounted = false;
+      if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+      if (typingActiveRef.current) socket.emit("typing:set", { conversationId: activeId, typing: false });
+      typingActiveRef.current = false;
+      socket.emit("conversation:leave", activeId);
+      socket.disconnect();
+      if (socketRef.current === socket) socketRef.current = null;
+    };
+  }, [activeId]);
+
+  useEffect(() => {
+    if (!messages.length) return;
+    if (shouldAutoScrollRef.current) bottomRef.current?.scrollIntoView({ behavior: initialMessageLoadRef.current ? "auto" : "smooth" });
+    initialMessageLoadRef.current = false;
+    shouldAutoScrollRef.current = false;
+  }, [messages]);
+
+  useEffect(() => {
+    if (!selectedFile || !selectedFile.type.startsWith("image/")) {
+      setPreviewUrl("");
+      return undefined;
+    }
+    const objectUrl = URL.createObjectURL(selectedFile);
+    setPreviewUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [selectedFile]);
+
+  async function send(event) {
+    event.preventDefault();
+    if (!activeId || (!draft.trim() && !selectedFile) || sending) return;
+    stopTyping();
+    setSending(true);
+    setUploadProgress(selectedFile ? 0 : null);
+    try {
+      const data = selectedFile
+        ? await uploadChatFile(activeId, selectedFile, draft, setUploadProgress)
+        : await chatRequest(`/conversations/${activeId}/messages`, { method: "POST", body: JSON.stringify({ text: draft }) });
+      shouldAutoScrollRef.current = true;
+      setMessages((current) => upsertMessage(current, data.message));
+      setDraft("");
+      setSelectedFile(null);
+      setUploadProgress(null);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      await refreshConversations();
+    } catch (requestError) {
+      setError(requestError.message);
+      setUploadProgress(null);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function selectFile(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    const extension = file.name.toLowerCase().match(/\.[^.]+$/)?.[0];
+    const allowedExtensions = {
+      "image/jpeg": [".jpg", ".jpeg"],
+      "image/png": [".png"],
+      "image/webp": [".webp"],
+      "application/pdf": [".pdf"],
+    };
+    if (!CHAT_FILE_TYPES.has(file.type) || !allowedExtensions[file.type]?.includes(extension)) {
+      setSelectedFile(null);
+      setError("Choose a valid JPG, PNG, WEBP, or PDF file.");
+      return;
+    }
+    if (file.size > MAX_CHAT_FILE_SIZE) {
+      setSelectedFile(null);
+      setError("Attachments must be 10 MB or smaller.");
+      return;
+    }
+    setError("");
+    setSelectedFile(file);
+    setUploadProgress(null);
+  }
+
+  async function editMessage(message) {
+    const text = window.prompt("Edit your message", message.text);
+    if (text === null || !text.trim()) return;
+    try {
+      const data = await chatRequest(`/conversations/${activeId}/messages/${message._id}`, { method: "PATCH", body: JSON.stringify({ text }) });
+      setMessages((current) => upsertMessage(current, data.message));
+    } catch (requestError) { setError(requestError.message); }
+  }
+
+  async function removeMessage(message) {
+    if (!window.confirm("Delete this message?")) return;
+    try {
+      const data = await chatRequest(`/conversations/${activeId}/messages/${message._id}`, { method: "DELETE" });
+      setMessages((current) => upsertMessage(current, data.message));
+    } catch (requestError) { setError(requestError.message); }
+  }
+
+  async function searchConversation(event) {
+    event.preventDefault();
+    const query = searchQuery.trim();
+    if (!query || !activeId) return;
+    setSearching(true);
+    try {
+      const data = await chatRequest(`/conversations/${activeId}/messages/search?q=${encodeURIComponent(query)}`);
+      setSearchResults(data.messages || []);
+    } catch (requestError) { setError(requestError.message); }
+    finally { setSearching(false); }
+  }
+
+  async function reactToMessage(message, emoji) {
+    setReactionPickerFor("");
+    try {
+      const data = await chatRequest(`/conversations/${activeId}/messages/${message._id}/reactions`, { method: "POST", body: JSON.stringify({ emoji }) });
+      applyReactions(data);
+    } catch (requestError) { setError(requestError.message); }
+  }
+
+
+  function jumpToMessage(message) {
+    setSearchResults(null);
+    setHighlightedMessageId(normalizeId(message._id));
+    requestAnimationFrame(() => messageElementsRef.current.get(normalizeId(message._id))?.scrollIntoView({ behavior: "smooth", block: "center" }));
+    window.setTimeout(() => setHighlightedMessageId(""), 1800);
+  }
+
+  function stopTyping(socket = socketRef.current, conversationId = activeId) {
+    if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+    typingTimerRef.current = null;
+    if (!typingActiveRef.current) return;
+    socket?.emit("typing:set", { conversationId, typing: false });
+    typingActiveRef.current = false;
+  }
+
+  function changeDraft(event) {
+    const nextDraft = event.target.value;
+    setDraft(nextDraft);
+    const socket = socketRef.current;
+    if (!nextDraft.trim() || !activeId || !socket?.connected) {
+      stopTyping(socket, activeId);
+      return;
+    }
+    if (!typingActiveRef.current) {
+      socket.emit("typing:set", { conversationId: activeId, typing: true });
+      typingActiveRef.current = true;
+    }
+    if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+    typingTimerRef.current = setTimeout(() => stopTyping(socket, activeId), 900);
+  }
+
+  function otherParticipant(conversation) {
+    return conversation?.participants?.find((person) => normalizeId(person) !== normalizeId(myId)) || conversation?.participants?.[0];
+  }
+
+  const allowedReactions = ["👍", "❤️", "😂", "😮", "😢", "🎉"];
+  return <div className="app-page"><Header /><main className="chat-page">
+    <div className="chat-heading"><div><p className="eyebrow">CAMPUS EXCHANGE</p><h1>Your Messages</h1><p className="muted-text">Chat directly with buyers and sellers on campus.</p></div></div>
+    {error && <p className="form-error" role="alert">{error}</p>}
+    <section className="chat-layout">
+      <aside className="conversation-list"><h2>Conversations</h2>{loading ? <p className="muted-text">Loading…</p> : conversations.length === 0 ? <p className="muted-text">No conversations yet. Start one from a marketplace listing.</p> : conversations.map((conversation) => <button key={conversation._id} type="button" className={`conversation-item ${activeId === conversation._id ? "active" : ""}`} onClick={() => navigate(`/messages?conversation=${conversation._id}`)}><strong>{otherParticipant(conversation)?.name || "Campus member"}{conversation.unreadCount > 0 && <span className="chat-unread-badge" aria-label={`${conversation.unreadCount} unread messages`}>{conversation.unreadCount}</span>}</strong><span>{conversation.listing?.title || "Listing"}</span><small>{conversation.lastMessage?.attachment ? `📎 ${conversation.lastMessage.attachment.filename}` : conversation.lastMessage?.text || "Start a conversation"}</small></button>)}</aside>
+      <section className="chat-thread">{activeConversation ? <><header className="chat-thread-header"><div className="chat-peer-heading"><span className={`presence-dot ${peerOnline ? "online" : "offline"}`} aria-label={peerOnline ? "Online" : "Offline"} /><h2>{otherParticipant(activeConversation)?.name || "Campus member"}</h2></div><p className="chat-peer-status" aria-live="polite">{peerTyping ? "Typing..." : peerOnline ? "Online" : "Offline"}</p><p>{activeConversation.listing?.title || "Marketplace listing"}</p><form className="chat-search-form" onSubmit={searchConversation}><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} maxLength={100} placeholder="Search this conversation" aria-label="Search messages" /><button type="submit" disabled={searching || !searchQuery.trim()}>{searching ? "Searching…" : "Search"}</button>{searchResults && <button type="button" onClick={() => setSearchResults(null)}>Close</button>}</form></header>{searchResults && <div className="chat-search-results"><strong>{searchResults.length} result{searchResults.length === 1 ? "" : "s"}</strong>{searchResults.length === 0 ? <small>No messages found.</small> : searchResults.map((message) => <button key={message._id} type="button" onClick={() => jumpToMessage(message)}><span>{message.sender?.name || "Student"} · {new Date(message.createdAt).toLocaleString()}</span><small>{message.text || message.attachment?.filename || "Attachment"}</small></button>)}</div>}<div className="chat-messages" ref={messagesViewportRef} onScroll={(event) => { const node = event.currentTarget; shouldAutoScrollRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 140; }}>{messages.map((message, index) => { const mine = normalizeId(message.sender) === normalizeId(myId); const deleted = Boolean(message.deletedAt); const edited = Boolean(message.editedAt) && !deleted; const receipt = message.readAt ? "read" : message.deliveredAt ? "delivered" : "sent"; const previous = messages[index - 1]; const newDay = !previous || new Date(previous.createdAt).toDateString() !== new Date(message.createdAt).toDateString(); const reactionGroups = (message.reactions || []).reduce((groups, reaction) => { groups[reaction.emoji] = (groups[reaction.emoji] || 0) + 1; return groups; }, {}); return <React.Fragment key={normalizeId(message._id)}>{newDay && <div className="chat-date-separator"><span>{chatDayLabel(message.createdAt)}</span></div>}<article ref={(node) => { if (node) messageElementsRef.current.set(normalizeId(message._id), node); else messageElementsRef.current.delete(normalizeId(message._id)); }} className={`chat-message ${mine ? "mine" : "theirs"} ${highlightedMessageId === normalizeId(message._id) ? "highlighted" : ""}`}><div className="chat-bubble">{message.replyTo && <button type="button" className="chat-reply-quote" onClick={() => { const target = messageElementsRef.current.get(normalizeId(message.replyTo._id)); target?.scrollIntoView({ behavior: "smooth", block: "center" }); }}><strong>{message.replyTo.sender?.name || "Student"}</strong><span>{message.replyTo.deletedAt ? "This message was deleted" : message.replyTo.text || message.replyTo.attachment?.filename || "Attachment"}</span></button>}{message.isForwarded && !deleted && <small className="chat-forwarded-label">↗ Forwarded</small>}{deleted ? <p>This message was deleted</p> : <>{message.text && <p>{message.text}</p>}{message.attachment && <SecureAttachment attachment={message.attachment} onError={setError} />}</>}<small className="chat-message-meta"><span>{mine ? "You" : message.sender?.name || "Student"}{edited ? " · edited" : ""} · {new Date(message.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</span>{mine && <span className={`message-receipt ${receipt}`} aria-label={receipt === "read" ? "Read" : receipt === "delivered" ? "Delivered" : "Sent"} title={receipt === "read" ? "Read" : receipt === "delivered" ? "Delivered" : "Sent"}>{receipt === "sent" ? "✓" : "✓✓"}</span>}</small></div>{Object.entries(reactionGroups).length > 0 && <div className="chat-reactions">{Object.entries(reactionGroups).map(([emoji, count]) => <button key={emoji} type="button" onClick={() => reactToMessage(message, emoji)} aria-label={`${emoji} ${count} reactions`}>{emoji} {count}</button>)}</div>}<div className="message-actions">{!deleted && <><button type="button" onClick={() => setReactionPickerFor(reactionPickerFor === normalizeId(message._id) ? "" : normalizeId(message._id))}>React</button>{reactionPickerFor === normalizeId(message._id) && <span className="chat-reaction-picker">{allowedReactions.map((emoji) => <button key={emoji} type="button" onClick={() => reactToMessage(message, emoji)}>{emoji}</button>)}</span>}</>}{mine && !deleted && <><button type="button" onClick={() => editMessage(message)}>Edit</button><button type="button" onClick={() => removeMessage(message)}>Delete</button></>}</div></article></React.Fragment>; })}<div ref={bottomRef} /></div><form className="chat-compose" onSubmit={send}>
+        {selectedFile && <div className="chat-upload-preview">{previewUrl ? <img src={previewUrl} alt="Selected attachment preview" /> : <span className="chat-attachment-file-icon">PDF</span>}<div><strong>{selectedFile.name}</strong><span>{selectedFile.type === "application/pdf" ? "PDF document" : `${selectedFile.type.split("/")[1].toUpperCase()} image`} · {formatFileSize(selectedFile.size)}</span></div><button type="button" onClick={() => { setSelectedFile(null); setUploadProgress(null); }}>Remove</button></div>}
+        {uploadProgress !== null && <div className="chat-upload-progress" role="status"><span>{uploadProgress < 100 ? `Uploading ${uploadProgress}%` : "Saving attachment…"}</span><progress max="100" value={uploadProgress} /></div>}
+        <div className="chat-compose-row"><label className={`chat-attach-button ${sending ? "disabled" : ""}`} title="Attach image or PDF">📎<span>Attach</span><input ref={fileInputRef} type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,image/jpeg,image/png,image/webp,application/pdf" onChange={selectFile} disabled={sending} aria-label="Attach an image or PDF" /></label><input value={draft} onChange={changeDraft} maxLength={4000} placeholder="Write a message…" aria-label="Write a message" /><button type="submit" className="button button-primary" disabled={sending || (!draft.trim() && !selectedFile)}>{sending ? "Sending…" : "Send"}</button></div>
+      </form></> : <div className="chat-empty"><span>💬</span><h2>Choose a conversation</h2><p>Your messages with other students will appear here.</p></div>}</section>
+    </section>
+  </main></div>;
 }
 
 // ============================================================
@@ -2397,36 +2976,28 @@ function Marketplace() {
   const actions = useListingActions(setProducts, true, isAdmin);
 
   async function startChat(product) {
-    const token = sessionStorage.getItem("campusExchangeToken");
+    const token = currentToken();
     if (!token) {
       navigate("/login");
       return;
     }
 
-    const listingId = product._id || product.id;
-    if (!listingId || !/^[a-f\\d]{24}$/i.test(String(listingId))) {
+    const listingId = product?._id || product?.id;
+    if (!listingId || !/^[a-f\d]{24}$/i.test(String(listingId))) {
       alert("This listing is not available for chat yet. Please refresh the marketplace.");
       return;
     }
 
     try {
-      const response = await fetch(`${API_BASE_URL}/chat/conversations`, {
+      const data = await chatRequest("/conversations", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
         body: JSON.stringify({ listingId }),
       });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(data.message || "Unable to start chat.");
-      }
       const conversationId = data.conversation?._id;
       if (!conversationId) throw new Error("The server did not return a conversation.");
-      navigate(`/chat/${conversationId}`);
+      navigate(`/messages?conversation=${conversationId}`);
     } catch (error) {
-      alert(error.message || "Unable to start chat.");
+      alert(error.message || "Unable to start this conversation.");
     }
   }
 
@@ -2602,7 +3173,7 @@ function Marketplace() {
                 product={product}
                 onEdit={isAdmin || product.owner?._id === sessionStorage.getItem("campusExchangeStudentId") ? setEditing : undefined}
                 onDelete={isAdmin || product.owner?._id === sessionStorage.getItem("campusExchangeStudentId") ? actions.deleteProduct : undefined}
-                onChat={!isAdmin && product.owner?._id && product.owner?._id !== sessionStorage.getItem("campusExchangeStudentId") ? startChat : undefined}
+                onChat={!isAdmin && product.owner?._id !== sessionStorage.getItem("campusExchangeStudentId") ? () => startChat(product) : undefined}
               />
             ))}
           </section>
@@ -2694,7 +3265,7 @@ function AdminLogin() {
 
   // API request helper
   async function authRequest(endpoint, payload) {
-    const response = await fetch(
+    const response = await apiFetch(
       `${API_BASE_URL}/auth/${endpoint}`,
       {
         method: "POST",
@@ -3419,6 +3990,15 @@ function CampusBlockDashboard() {
 
   const actions = useListingActions(setProducts, true);
 
+  async function startChat(product) {
+    try {
+      const data = await chatRequest("/conversations", { method: "POST", body: JSON.stringify({ listingId: product.id }) });
+      navigate(`/messages?conversation=${data.conversation._id}`);
+    } catch (error) {
+      alert(error.message || "Unable to start this conversation.");
+    }
+  }
+
   useEffect(() => {
     let active = true;
     setListingsLoading(true);
@@ -3491,6 +4071,7 @@ function CampusBlockDashboard() {
                 product={product}
                 onEdit={product.owner?._id === sessionStorage.getItem("campusExchangeStudentId") ? setEditing : undefined}
                 onDelete={product.owner?._id === sessionStorage.getItem("campusExchangeStudentId") ? actions.deleteProduct : undefined}
+                onChat={product.owner?._id !== sessionStorage.getItem("campusExchangeStudentId") ? () => startChat(product) : undefined}
               />
             ))}
           </section>
@@ -3557,346 +4138,6 @@ function CampusBlockDashboard() {
 
 
 // ============================================================
-// STUDENT CHAT
-// ============================================================
-
-function ChatPage() {
-  const navigate = useNavigate();
-  const { conversationId: routeConversationId } = useParams();
-  const [conversations, setConversations] = useState([]);
-  const [messages, setMessages] = useState([]);
-  const [activeConversation, setActiveConversation] = useState(null);
-  const [draft, setDraft] = useState("");
-  const [editingMessageId, setEditingMessageId] = useState(null);
-  const [editingText, setEditingText] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [sending, setSending] = useState(false);
-  const [error, setError] = useState("");
-  const [socketStatus, setSocketStatus] = useState("connecting");
-  const socketRef = useRef(null);
-  const bottomRef = useRef(null);
-  const token = sessionStorage.getItem("campusExchangeToken");
-  const currentUserId = sessionStorage.getItem("campusExchangeStudentId");
-
-  const chatRequest = async (path, options = {}) => {
-    const response = await fetch(`${API_BASE_URL}/chat${path}`, {
-      ...options,
-      headers: {
-        ...(options.body ? { "Content-Type": "application/json" } : {}),
-        Authorization: `Bearer ${token}`,
-        ...options.headers,
-      },
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.message || "Chat request failed.");
-    return data;
-  };
-
-  const loadConversations = async () => {
-    const data = await chatRequest("/conversations");
-    setConversations(data.conversations || []);
-    return data.conversations || [];
-  };
-
-  const loadMessages = async (id) => {
-    if (!id) {
-      setMessages([]);
-      setActiveConversation(null);
-      return;
-    }
-    const [messageData, conversationData] = await Promise.all([
-      chatRequest(`/conversations/${id}/messages`),
-      chatRequest("/conversations"),
-    ]);
-    const list = conversationData.conversations || [];
-    setConversations(list);
-    setActiveConversation(list.find((item) => item._id === id) || null);
-    setMessages(messageData.messages || []);
-    await chatRequest(`/conversations/${id}/read`, { method: "PATCH" });
-  };
-
-  useEffect(() => {
-    if (!token) {
-      navigate("/login", { replace: true });
-      return;
-    }
-    let alive = true;
-    setLoading(true);
-    loadConversations()
-      .then((list) => {
-        if (!alive) return;
-        if (routeConversationId) return loadMessages(routeConversationId);
-        if (list.length) navigate(`/chat/${list[0]._id}`, { replace: true });
-      })
-      .catch((err) => {
-        if (alive) setError(err.message || "Unable to load chats.");
-      })
-      .finally(() => {
-        if (alive) setLoading(false);
-      });
-    return () => { alive = false; };
-  }, [routeConversationId]);
-
-  useEffect(() => {
-    if (!token) return undefined;
-    const socket = io(
-      (import.meta.env.VITE_API_URL || "http://localhost:5001").replace(/\/$/, ""),
-      { auth: { token }, transports: ["websocket", "polling"] }
-    );
-    socketRef.current = socket;
-    socket.on("connect", () => setSocketStatus("connected"));
-    socket.on("disconnect", () => setSocketStatus("disconnected"));
-    socket.on("connect_error", () => setSocketStatus("disconnected"));
-
-    const belongsToActive = (message) => {
-      const id = message?.conversation?._id || message?.conversation;
-      return String(id) === String(routeConversationId);
-    };
-    socket.on("message:new", (message) => {
-      if (belongsToActive(message)) {
-        setMessages((current) => current.some((item) => item._id === message._id) ? current : [...current, message]);
-        chatRequest(`/conversations/${routeConversationId}/read`, { method: "PATCH" }).catch(() => {});
-      }
-      loadConversations().catch(() => {});
-    });
-    socket.on("message:edited", (message) => {
-      if (belongsToActive(message)) {
-        setMessages((current) => current.map((item) => item._id === message._id ? message : item));
-      }
-    });
-    socket.on("message:deleted", (message) => {
-      if (belongsToActive(message)) {
-        setMessages((current) => current.map((item) => item._id === message._id ? { ...item, ...message } : item));
-      }
-    });
-    socket.on("messages:read", (event) => {
-      if (String(event.conversationId) === String(routeConversationId)) {
-        setMessages((current) => current.map((item) =>
-          item.sender?._id === currentUserId && !item.readAt
-            ? { ...item, readAt: event.readAt }
-            : item
-        ));
-      }
-    });
-    return () => {
-      socket.disconnect();
-      socketRef.current = null;
-    };
-  }, [token, routeConversationId]);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
-
-  async function sendMessage(event) {
-    event.preventDefault();
-    const content = draft.trim();
-    if (!content || !routeConversationId || sending) return;
-    setSending(true);
-    setError("");
-    try {
-      const data = await chatRequest(`/conversations/${routeConversationId}/messages`, {
-        method: "POST",
-        body: JSON.stringify({ content }),
-      });
-      setMessages((current) => current.some((item) => item._id === data.newMessage._id) ? current : [...current, data.newMessage]);
-      setDraft("");
-      loadConversations().catch(() => {});
-    } catch (err) {
-      setError(err.message || "Unable to send message.");
-    } finally {
-      setSending(false);
-    }
-  }
-
-  async function saveEdit(messageId) {
-    const content = editingText.trim();
-    if (!content) return;
-    try {
-      const data = await chatRequest(`/messages/${messageId}`, {
-        method: "PATCH",
-        body: JSON.stringify({ content }),
-      });
-      setMessages((current) => current.map((item) => item._id === messageId ? data.updatedMessage : item));
-      setEditingMessageId(null);
-      setEditingText("");
-    } catch (err) {
-      setError(err.message || "Unable to edit message.");
-    }
-  }
-
-  async function deleteMessage(messageId) {
-    if (!window.confirm("Delete this message?")) return;
-    try {
-      await chatRequest(`/messages/${messageId}`, { method: "DELETE" });
-      setMessages((current) => current.map((item) =>
-        item._id === messageId
-          ? { ...item, content: "This message was deleted", isDeleted: true, edited: false }
-          : item
-      ));
-    } catch (err) {
-      setError(err.message || "Unable to delete message.");
-    }
-  }
-
-  const otherParticipant = activeConversation
-    ? (String(activeConversation.buyer?._id) === String(currentUserId)
-        ? activeConversation.seller
-        : activeConversation.buyer)
-    : null;
-
-  return (
-    <div className="app-page chat-page">
-      <Header />
-      <main className="chat-shell">
-        <aside className="chat-sidebar">
-          <div className="chat-sidebar-heading">
-            <div>
-              <p className="eyebrow">CAMPUS EXCHANGE</p>
-              <h1>Messages</h1>
-            </div>
-            <span className={`chat-connection ${socketStatus}`} title={socketStatus}>
-              {socketStatus === "connected" ? "● Online" : "● Connecting"}
-            </span>
-          </div>
-          {loading ? <p className="muted-text">Loading conversations…</p> : conversations.length === 0 ? (
-            <div className="chat-empty-list">
-              <span>💬</span>
-              <h3>No conversations yet</h3>
-              <p>Open a marketplace listing and select Let's Chat to contact its seller.</p>
-              <button className="button button-primary" onClick={() => navigate("/marketplace")}>Browse marketplace</button>
-            </div>
-          ) : conversations.map((conversation) => {
-            const isBuyer = String(conversation.buyer?._id) === String(currentUserId);
-            const person = isBuyer ? conversation.seller : conversation.buyer;
-            const selected = conversation._id === routeConversationId;
-            return (
-              <button
-                type="button"
-                key={conversation._id}
-                className={`chat-conversation-item ${selected ? "active" : ""}`}
-                onClick={() => navigate(`/chat/${conversation._id}`)}
-              >
-                <span className="chat-avatar">{(person?.name || "S").charAt(0).toUpperCase()}</span>
-                <span className="chat-conversation-copy">
-                  <strong>{person?.name || "Student"}</strong>
-                  <small>{conversation.listing?.title || "Marketplace item"}</small>
-                  <small className="chat-last-message">{conversation.lastMessage?.content || "Start a conversation"}</small>
-                </span>
-              </button>
-            );
-          })}
-        </aside>
-
-        <section className="chat-main">
-          {!routeConversationId ? (
-            <div className="chat-welcome">
-              <span>💬</span>
-              <h2>Your campus conversations</h2>
-              <p>Select a conversation or start chatting from a marketplace listing.</p>
-            </div>
-          ) : (
-            <>
-              <header className="chat-header">
-                <button className="chat-back-button" onClick={() => navigate("/chat")} aria-label="Back to conversations">←</button>
-                <span className="chat-avatar">{(otherParticipant?.name || "S").charAt(0).toUpperCase()}</span>
-                <div>
-                  <strong>{otherParticipant?.name || "Student"}</strong>
-                  <small>{activeConversation?.listing?.title || "Marketplace conversation"}</small>
-                </div>
-              </header>
-              {error && <p className="form-error chat-error" role="alert">{error}</p>}
-              <div className="chat-message-list">
-                {messages.map((message) => {
-                  const mine = String(message.sender?._id || message.sender) === String(currentUserId);
-                  return (
-                    <div key={message._id} className={`chat-message-row ${mine ? "mine" : "theirs"}`}>
-                      <div className="chat-bubble">
-                        {editingMessageId === message._id ? (
-                          <div className="chat-edit-form">
-                            <textarea value={editingText} onChange={(event) => setEditingText(event.target.value)} maxLength={2000} />
-                            <div>
-                              <button onClick={() => saveEdit(message._id)}>Save</button>
-                              <button onClick={() => setEditingMessageId(null)}>Cancel</button>
-                            </div>
-                          </div>
-                        ) : (
-                          <>
-                            <p>{message.content}</p>
-                            <div className="chat-message-meta">
-                              <small>{new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small>
-                              {message.edited && !message.isDeleted && <small> · edited</small>}
-                              {mine && message.readAt && <small> · ✓✓ Read</small>}
-                            </div>
-                            {mine && !message.isDeleted && (
-                              <div className="chat-message-actions">
-                                <button onClick={() => { setEditingMessageId(message._id); setEditingText(message.content); }}>Edit</button>
-                                <button onClick={() => deleteMessage(message._id)}>Delete</button>
-                              </div>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-                <div ref={bottomRef} />
-              </div>
-              <form className="chat-compose" onSubmit={sendMessage}>
-                <textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Type a message…" maxLength={2000} rows={1} />
-                <button className="button button-primary" type="submit" disabled={sending || !draft.trim()}>
-                  {sending ? "Sending…" : "Send"}
-                </button>
-              </form>
-            </>
-          )}
-        </section>
-      </main>
-      <style>{`
-        .chat-shell{max-width:1200px;height:min(760px,calc(100vh - 150px));min-height:520px;margin:32px auto;padding:0 22px;display:grid;grid-template-columns:340px 1fr;gap:0}
-        .chat-sidebar,.chat-main{background:#fff;border:1px solid #e5e7eb;min-height:0}
-        .chat-sidebar{border-radius:18px 0 0 18px;overflow:auto}
-        .chat-sidebar-heading{padding:22px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #edf0f2}
-        .chat-sidebar-heading h1{margin:4px 0;font-size:25px}
-        .chat-connection{font-size:12px;color:#64748b;white-space:nowrap}
-        .chat-connection.connected{color:#159447}
-        .chat-conversation-item{width:100%;display:flex;gap:12px;text-align:left;padding:16px;border:0;border-bottom:1px solid #f0f2f4;background:#fff;cursor:pointer}
-        .chat-conversation-item.active,.chat-conversation-item:hover{background:#f0f8f5}
-        .chat-avatar{width:42px;height:42px;flex:0 0 42px;border-radius:50%;display:grid;place-items:center;background:#dff3e9;color:#16734b;font-weight:700}
-        .chat-conversation-copy{min-width:0;display:flex;flex-direction:column;gap:4px}
-        .chat-conversation-copy strong{color:#172b25}
-        .chat-conversation-copy small{color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px}
-        .chat-last-message{font-size:12px}
-        .chat-main{border-radius:0 18px 18px 0;display:flex;flex-direction:column;overflow:hidden}
-        .chat-header{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid #edf0f2}
-        .chat-header div{display:flex;flex-direction:column;gap:3px}
-        .chat-header small{color:#64748b}
-        .chat-back-button{border:0;background:transparent;font-size:25px;cursor:pointer}
-        .chat-message-list{flex:1;overflow:auto;padding:22px;background:#f7faf8}
-        .chat-message-row{display:flex;margin:10px 0}
-        .chat-message-row.mine{justify-content:flex-end}
-        .chat-bubble{max-width:min(75%,520px);padding:10px 13px;border-radius:15px;background:#fff;box-shadow:0 1px 2px #00000010;overflow-wrap:anywhere}
-        .chat-message-row.mine .chat-bubble{background:#dcf8e9}
-        .chat-bubble p{margin:0;white-space:pre-wrap}
-        .chat-message-meta{display:flex;justify-content:flex-end;gap:3px;margin-top:5px;color:#64748b;font-size:11px}
-        .chat-message-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:5px}
-        .chat-message-actions button,.chat-edit-form button{border:0;background:transparent;color:#16734b;font-size:12px;cursor:pointer}
-        .chat-compose{display:flex;gap:10px;padding:14px;border-top:1px solid #edf0f2}
-        .chat-compose textarea{flex:1;resize:vertical;min-height:42px;max-height:120px;border:1px solid #d7dee2;border-radius:12px;padding:11px;font:inherit}
-        .chat-empty-list,.chat-welcome{padding:32px;text-align:center;color:#64748b}
-        .chat-empty-list span,.chat-welcome span{font-size:40px}
-        .chat-empty-list h3,.chat-welcome h2{color:#172b25}
-        .chat-welcome{margin:auto}
-        .chat-error{margin:8px 18px 0}
-        .chat-edit-form textarea{width:100%;min-width:220px;min-height:70px;border:1px solid #cbd5e1;border-radius:8px;padding:8px;font:inherit}
-        .chat-edit-form div{display:flex;justify-content:flex-end;gap:10px;margin-top:6px}
-        @media(max-width:760px){.chat-shell{height:calc(100vh - 125px);min-height:450px;margin:14px auto;padding:0 10px;grid-template-columns:1fr}.chat-sidebar{border-radius:16px 16px 0 0;max-height:220px}.chat-main{border-radius:0 0 16px 16px}.chat-conversation-item{padding:10px}.chat-message-list{padding:12px}.chat-bubble{max-width:88%}}
-      `}</style>
-    </div>
-  );
-}
-
-// ============================================================
 // APP ROUTES
 // ============================================================
 
@@ -3939,11 +4180,13 @@ function AppRoutes() {
         }
       />
 
+      <Route path="/messages" element={<ProtectedMarketplaceRoute><ChatCenter /></ProtectedMarketplaceRoute>} />
+
       <Route
         path="/chat"
         element={
           <ProtectedStudentRoute>
-            <ChatPage />
+            <ChatCenter />
           </ProtectedStudentRoute>
         }
       />
@@ -3952,7 +4195,7 @@ function AppRoutes() {
         path="/chat/:conversationId"
         element={
           <ProtectedStudentRoute>
-            <ChatPage />
+            <ChatCenter />
           </ProtectedStudentRoute>
         }
       />
