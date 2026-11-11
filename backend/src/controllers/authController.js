@@ -1,7 +1,6 @@
 import User from "../models/User.js";
 import jwt from "jsonwebtoken";
 import { z } from "zod";
-import nodemailer from "nodemailer";
 import crypto from "crypto";
 
 // ========================================
@@ -40,7 +39,7 @@ const hashOtp = (otp) => {
 };
 
 // ========================================
-// SEND OTP EMAIL
+// SEND OTP EMAIL USING RESEND API
 // ========================================
 
 const sendOtpEmail = async (email, otp, purpose) => {
@@ -61,19 +60,32 @@ const sendOtpEmail = async (email, otp, purpose) => {
     body: JSON.stringify({
       from: process.env.EMAIL_FROM || "onboarding@resend.dev",
       to: [email],
+
       subject: isVerification
         ? "Campus Exchange - Email Verification"
         : "Campus Exchange - Password Reset",
+
       text: `Your OTP is ${otp}. It expires in 10 minutes.`,
+
       html: `
         <div style="font-family:Arial;padding:20px">
           <h2>Campus Exchange</h2>
-          <p>Your ${
-            isVerification ? "email verification" : "password reset"
-          } code is:</p>
+
+          <p>
+            Your ${
+              isVerification
+                ? "email verification"
+                : "password reset"
+            } code is:
+          </p>
+
           <h1 style="letter-spacing:5px">${otp}</h1>
+
           <p>This OTP expires in 10 minutes.</p>
-          <p>If you did not request this code, ignore this email.</p>
+
+          <p>
+            If you did not request this code, ignore this email.
+          </p>
         </div>
       `,
     }),
@@ -83,66 +95,13 @@ const sendOtpEmail = async (email, otp, purpose) => {
 
   if (!response.ok) {
     console.error("Resend API error:", result);
-    throw new Error(result.message || "Failed to send OTP email");
+
+    throw new Error(
+      result.message || "Failed to send OTP email"
+    );
   }
 
   console.log("OTP email sent successfully:", result.id);
-};
-  const {
-    SMTP_HOST,
-    SMTP_PORT,
-    SMTP_USER,
-    SMTP_PASS,
-  } = process.env;
-
-  if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) {
-    throw new Error("SMTP configuration is missing in .env");
-  }
-
-  const transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT),
-    secure: Number(SMTP_PORT) === 465,
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
-  });
-
-  const isVerification = purpose === "verify";
-
-  await transporter.sendMail({
-    from: process.env.EMAIL_FROM || SMTP_USER,
-    to: email,
-
-    subject: isVerification
-      ? "Campus Exchange - Email Verification"
-      : "Campus Exchange - Password Reset",
-
-    text: `Your OTP is ${otp}. It expires in 10 minutes.`,
-
-    html: `
-      <div style="font-family:Arial;padding:20px">
-        <h2>Campus Exchange</h2>
-
-        <p>
-          Your ${
-            isVerification
-              ? "email verification"
-              : "password reset"
-          } code is:
-        </p>
-
-        <h1 style="letter-spacing:5px">${otp}</h1>
-
-        <p>This OTP expires in 10 minutes.</p>
-
-        <p>
-          If you did not request this code, ignore this email.
-        </p>
-      </div>
-    `,
-  });
 };
 
 // ========================================
@@ -187,6 +146,7 @@ export const register = async (req, res) => {
     }
 
     const { name, email, password } = validation.data;
+
     const normalizedEmail = email.toLowerCase();
 
     let user = await User.findOne({
@@ -205,8 +165,11 @@ export const register = async (req, res) => {
       user.name = name;
       user.password = password;
       user.isEmailVerified = false;
+
       user.emailOtpHash = hashOtp(otp);
-      user.emailOtpExpiresAt = new Date(Date.now() + OTP_EXPIRY);
+      user.emailOtpExpiresAt = new Date(
+        Date.now() + OTP_EXPIRY
+      );
 
       await user.save();
     } else {
@@ -214,13 +177,21 @@ export const register = async (req, res) => {
         name,
         email: normalizedEmail,
         password,
+
         isEmailVerified: false,
+
         emailOtpHash: hashOtp(otp),
-        emailOtpExpiresAt: new Date(Date.now() + OTP_EXPIRY),
+        emailOtpExpiresAt: new Date(
+          Date.now() + OTP_EXPIRY
+        ),
       });
     }
 
-    await sendOtpEmail(normalizedEmail, otp, "verify");
+    await sendOtpEmail(
+      normalizedEmail,
+      otp,
+      "verify"
+    );
 
     return res.status(201).json({
       message: "OTP sent successfully. Verify your email.",
@@ -274,6 +245,7 @@ export const verifyEmailOtp = async (req, res) => {
     }
 
     user.isEmailVerified = true;
+
     user.emailOtpHash = undefined;
     user.emailOtpExpiresAt = undefined;
 
@@ -363,9 +335,9 @@ export const forgotPassword = async (req, res) => {
     }
 
     const email = validation.data.email.toLowerCase();
+
     const requestedRole = req.resetRole || "student";
 
-    // Find a verified account matching the requested role.
     const user = await User.findOne({
       email,
       isEmailVerified: true,
@@ -384,11 +356,18 @@ export const forgotPassword = async (req, res) => {
       const otp = generateOtp();
 
       user.resetOtpHash = hashOtp(otp);
-      user.resetOtpExpiresAt = new Date(Date.now() + OTP_EXPIRY);
+
+      user.resetOtpExpiresAt = new Date(
+        Date.now() + OTP_EXPIRY
+      );
 
       await user.save();
 
-      await sendOtpEmail(email, otp, "reset");
+      await sendOtpEmail(
+        email,
+        otp,
+        "reset"
+      );
 
       console.log(
         "Password reset OTP email sent successfully to:",
@@ -397,7 +376,8 @@ export const forgotPassword = async (req, res) => {
     }
 
     return res.status(200).json({
-      message: "If the account exists, a password reset OTP has been sent.",
+      message:
+        "If the account exists, a password reset OTP has been sent.",
     });
   } catch (error) {
     console.error("Forgot password error:", error);
@@ -429,13 +409,16 @@ export const resetPassword = async (req, res) => {
     }
 
     const { email, otp, newPassword } = validation.data;
+
     const requestedRole = req.resetRole || "student";
 
     const user = await User.findOne({
       email: email.toLowerCase(),
       isEmailVerified: true,
       role: requestedRole,
-    }).select("+resetOtpHash +resetOtpExpiresAt +password");
+    }).select(
+      "+resetOtpHash +resetOtpExpiresAt +password"
+    );
 
     if (
       !user ||
@@ -450,6 +433,7 @@ export const resetPassword = async (req, res) => {
     }
 
     user.password = newPassword;
+
     user.resetOtpHash = undefined;
     user.resetOtpExpiresAt = undefined;
 
@@ -503,7 +487,9 @@ export const changePassword = async (req, res) => {
       });
     }
 
-    const isMatch = await user.comparePassword(currentPassword);
+    const isMatch = await user.comparePassword(
+      currentPassword
+    );
 
     if (!isMatch) {
       return res.status(401).json({
